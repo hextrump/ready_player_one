@@ -1,0 +1,39 @@
+# ============================================
+# 头号玩家 (Ready Player One) - Dependencies
+# ============================================
+
+# --- Screen Capture ---
+mss>=9.0.0
+
+# --- YOLO Object Detection ---
+ultralytics>=8.1.0
+
+# --- OpenCV ---
+opencv-python>=4.9.0.0
+
+# --- OCR ---
+paddlepaddle>=2.6.0
+paddleocr>=2.7.0
+
+# --- State Machine ---
+transitions>=0.9.0
+
+# --- Keyboard/Mouse Control ---
+pydirectinput>=1.0.4
+pyautogui>=0.9.54
+
+# --- Configuration ---
+pyyaml>=6.0.1
+
+# --- VLM (Gemini) ---
+google-generativeai>=0.4.0
+
+# --- Data Processing ---
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# --- Testing ---
+pytest>=7.4.0
+
+# --- Logging ---
+loguru>=0.7.0
