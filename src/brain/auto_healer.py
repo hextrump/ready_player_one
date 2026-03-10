@@ -25,13 +25,15 @@ class AutoHealer:
         self,
         window_capture: WindowCapture,
         game_controller: GameController,
+        hp_monitor: Optional[HPMonitor] = None, # 支持外部传入
         hp_threshold: float = 0.5,
         mp_threshold: float = 0.3,
-        check_interval: float = 0.2,  # 回归极速高频检测：每0.2秒一扫 (依靠刚重构完的最速 OpenCV 读取)
+        check_interval: float = 0.2, 
     ):
         self.wc = window_capture
         self.ctrl = game_controller
-        self.hp_monitor = HPMonitor()
+        # 如果外部传了就用外部的，否则自己建（保持兼容）
+        self.hp_monitor = hp_monitor if hp_monitor else HPMonitor()
         
         self.hp_threshold = hp_threshold
         self.mp_threshold = mp_threshold
