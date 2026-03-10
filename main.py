@@ -61,6 +61,7 @@ class AgentV5:
         self.auto_healer = AutoHealer(
             window_capture=self.capture,
             game_controller=self.controller,
+            hp_monitor=self.hp_monitor, # 直接传入同一个引用
             hp_threshold=0.5,
             mp_threshold=0.3
         )

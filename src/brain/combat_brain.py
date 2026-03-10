@@ -83,35 +83,29 @@ class Target:
 
 class CombatBrain:
     def __init__(self):
-        # 1. 核心综合大模型 Super Brain V11 (高清纠偏版)
+        # 1. 核心大模型 - 尝试寻找那个“更聪明”的昨天版本 (V10)
         self.super_model = None
-        # 优先使用 models/ 文件夹下的统一路径 (方便从 GitHub 拉取代码后直接运行)
         possible_paths = [
-            "models/super_brain_v11.pt",
-            "runs/detect/super_brain_v11_highres/weights/best.pt",
-            "runs/detect/runs/detect/super_brain_v11_highres/weights/best.pt"
+            "runs/detect/runs/detect/super_brain_v10_mar92/weights/best.pt", # 昨天那个“聪明”的版本
+            "models/super_brain_v11.pt", 
+            "runs/detect/super_brain_v11_highres/weights/best.pt"
         ]
         
         for path in possible_paths:
             try:
                 self.super_model = YOLO(path)
-                log.info(f"成功激活超级大脑: {path}")
+                log.info(f"成功激活超级大脑 (感知纠偏): {path}")
                 break
             except:
                 continue
                 
         if self.super_model is None:
-            log.error("无法加载 Super Brain V11，尝试加载本地备份...")
+            log.error("无法加载核心模型，尝试使用兜底万能模型猪猪版...")
             try:
-                # 同样优先 check models
                 self.super_model = YOLO("models/monster_v19.pt")
-                log.info("已切换至 models/monster_v19 备份模型")
+                log.info("已切换至 models/monster_v19 兜底")
             except:
-                try:
-                    self.super_model = YOLO("runs/detect/runs/detect/monster_v19_pig/weights/best.pt")
-                    log.info("已切换至 runs/detect 旧版本地路径备份")
-                except:
-                    log.error("核心识别模型完全不可用！")
+                log.error("核心识别模型完全不可用！")
 
         # 2. 子系统模型 (地形识别)
         self.terrain_model = None
@@ -182,7 +176,7 @@ class CombatBrain:
             time.sleep(max(0.01, 0.2 - elapsed))
 
     def find_targets(self, frame) -> tuple[List[Target], int, int, Optional[tuple], Optional[tuple]]:
-        """单模型全要素扫描：利用 Super Brain V10 实现高精度识别与冲突处理"""
+        """分层感知系统：对怪、人、UI采用精细化的独立识别门槛"""
         targets = []
         player_x, player_y = 800, 520
         player_rect = None
@@ -190,25 +184,10 @@ class CombatBrain:
         mp_box = None
         
         if self.super_model:
-            # 使用 imgsz=1280 以匹配训练分辨率，彻底解决定位“歪”的问题
-            results = self.super_model(frame, conf=0.5, imgsz=1280, verbose=False)[0]
+            # 🧪 调优：基础门槛降到 0.2，把原始数据全拿出来，后续根据分类做“细活”
+            results = self.super_model(frame, conf=0.2, imgsz=640, verbose=False)[0]
             
-            # --- 第一步：先确定 Player 位置 ---
-            for box in results.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                cls_id = int(box.cls[0])
-                name = results.names[cls_id]
-                
-                if name == "Player":
-                    player_x, player_y = cx, cy
-                    player_rect = (x1, y1, x2, y2)
-                    break # 找到主玩家即可
-            else:
-                if time.time() % 2 < 0.1: # 仅每2秒记录一次，避免刷屏
-                    log.warning("Vision: 未检测到 Player，使用预测/默认位置 (800, 520)")
-            
-            # --- 第二步：收集怪物和其他实体，并过滤掉遮挡玩家的误报 ---
+            # --- 第一步：Player 确认 (低门槛 0.25，防止动起来就消失) ---
             for box in results.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -216,29 +195,43 @@ class CombatBrain:
                 name = results.names[cls_id]
                 conf = float(box.conf[0])
                 
+                if name == "Player" and conf >= 0.25:
+                    player_x, player_y = cx, cy
+                    player_rect = (x1, y1, x2, y2)
+                    break 
+            
+            # --- 第二步：收集要素 (怪采用高门槛 0.7，防止捡破烂，UI 采用中门槛) ---
+            for box in results.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                cls_id = int(box.cls[0])
+                name = results.names[cls_id]
+                conf = float(box.conf[0])
+                w, h = x2 - x1, y2 - y1
+                
                 if name in ["Monster", "Wild Boar", "Dark Axe Stump", "Pig", "Ribbon Pig"]:
-                    # ⚠️ 核心冲突处理：如果怪物框与玩家框重合度过高，判定为 Player 误报成 Monster
-                    if player_rect:
-                        # 计算交集区域
-                        ix1 = max(x1, player_rect[0])
-                        iy1 = max(y1, player_rect[1])
-                        ix2 = min(x2, player_rect[2])
-                        iy2 = min(y2, player_rect[3])
+                    # 💡 纠偏：怪物不仅要看信心度 (0.7)，还要检查尺寸，防止把地上掉的东西当怪
+                    if conf < 0.7 or w < 30 or h < 30:
+                        continue
                         
-                        if ix2 > ix1 and iy2 > iy1:
-                            # 简单的重叠判定：如果怪物中心在玩家框内，直接忽略
-                            if player_rect[0] < cx < player_rect[2] and player_rect[1] < cy < player_rect[3]:
-                                continue
+                    # 冲突过滤：只要中心点在玩家附近，视作误报
+                    if player_rect:
+                        if player_rect[0] < cx < player_rect[2] and player_rect[1] < cy < player_rect[3]:
+                            continue
                                 
                     targets.append(Target(
-                        name="Monster", cx=cx, cy=cy, w=x2-x1, h=y2-y1, 
+                        name="Monster", cx=cx, cy=cy, w=w, h=h, 
                         conf=conf, dist=0.0
                     ))
                 elif name == "HP":
                     hp_box = (x1, y1, x2, y2)
+                    if hasattr(self, 'hp_monitor_ref'):
+                        self.hp_monitor_ref.hp_bbox = (x1, y1, w, h)
                 elif name == "MP":
                     mp_box = (x1, y1, x2, y2)
-            
+                    if hasattr(self, 'hp_monitor_ref'):
+                        self.hp_monitor_ref.mp_bbox = (x1, y1, w, h)
+        
         # 计算距离
         for t in targets:
             t.dist = math.hypot(t.cx - player_x, t.cy - player_y)
@@ -318,6 +311,7 @@ class CombatBrain:
     def run(self, capture: WindowCapture, controller: GameController, hp_monitor: Optional[HPMonitor] = None, show_vision: bool = True):
         """主战斗循环"""
         self._running = True
+        self.hp_monitor_ref = hp_monitor # 保存引用，供 find_targets 动态校准使用
         log.info("=== Combat Brain V6.0 (Unified Entity & NavMesh) ONLINE ===")
         log.info(f"State: {self.state.value}")
         
@@ -441,8 +435,8 @@ class CombatBrain:
                         path_cooldown = (time.time() - self._last_path_time) < 1.5
 
                         if self.terrain_model is not None and (target_moved > 150 or not path_cooldown):
-                            # 只有目标大幅瞬移或距离上次算路已久，才重新扫描地形和算路
-                            res = self.terrain_model(frame, conf=0.4, verbose=False)[0]
+                            # 🧪 调优：地形识别回退到 640 分辨率以释放 GPU 压力，确保找怪不卡顿
+                            res = self.terrain_model(frame, conf=0.25, imgsz=640, verbose=False)[0]
                             plats, ropes = [], []
                             for box in res.boxes:
                                 c = int(box.cls[0])
@@ -458,44 +452,55 @@ class CombatBrain:
                                 self._last_path_time = time.time()
                                 self._last_path_pos = (best.cx, best.cy)
                         
-                        # ── 寻路中断逻辑: 只有怪物离得足够近才停下，且保持大步流星的冲劲 ──
+                        # ── 寻路中断逻辑 ──
                         def check_nearby_monster():
                             with self._vision_lock:
                                 perception_targets = self._latest_perception["targets"]
                                 px = self._latest_perception["player_x"]
                                 py = self._latest_perception["player_y"]
                             if not perception_targets: return False
-                            # 稍微放宽中断判定范围 (buffer_x=-20)，比刚才更敏感一点
                             for t in perception_targets:
                                 if self.is_in_attack_range(t, px, py, buffer_x=-20):
                                     return True
                             return False
 
                         if path:
-                            log.info(f"[APPROACH] 执行导航路径 -> {best.name}, 共 {len(path)} 步 (支持动态拦截)")
+                            log.info(f"[APPROACH] 执行导航路径 -> {best.name}, 共 {len(path)} 步")
                             translator.execute_path(path, nav_builder.nodes, check_interrupt=check_nearby_monster)
                         else:
-                            # ==== 直线阔步分支：大步流星，果敢行进 ====
+                            # ==== 直线阔步分支：恢复大步流星 + 防卡死跳跃 ====
                             direction = self.get_direction_to_target(best, player_x)
                             
-                            # 策略：如果离得近 (140~300px)，迈半步 (0.5s)；如果很远，迈阔步 (1.5s)
+                            # 恢复昨天那种“聪明”的大步间距
                             move_duration = 1.5 if best.dist > 300 else 0.5
-                            log.info(f"[MOVE-FLAT] {best.name} @ {best.dist:.0f}px, 豪迈迈步 {move_duration}s")
+                            log.info(f"[MOVE-FLAT] {best.name} @ {best.dist:.0f}px, 迈步 {move_duration}s 并监控地形")
                             
                             controller.key_down(direction.value)
                             start_t = time.time()
-                            interrupted = False
+                            last_px = player_x
+                            stuck_t = 0
+                            
                             while time.time() - start_t < move_duration:
-                                # 💡 阔步冲劲：前 0.4s 绝不回头，保持“大步流星”的惯性
-                                if (time.time() - start_t > 0.4) and check_nearby_monster():
-                                    log.info(f"!! 发现截击机会，停步开火 !! (进度: {time.time()-start_t:.1f}s)")
-                                    interrupted = True
+                                with self._vision_lock:
+                                    current_px = self._latest_perception["player_x"]
+                                
+                                # 💡 如果原地踏步，说明在沟里或撞墙，跳一下脱困
+                                if abs(current_px - last_px) < 3:
+                                    stuck_t += 1
+                                    if stuck_t > 5: # 约 0.2s 不动就跳
+                                        log.info("!! 检测到地形卡顿，执行脱困大跳 !!")
+                                        controller.jump()
+                                        stuck_t = 0
+                                else:
+                                    stuck_t = 0
+                                last_px = current_px
+
+                                # 前段保持冲劲，后段允许截击
+                                if (time.time() - start_t > 0.3) and check_nearby_monster():
                                     break
                                 time.sleep(0.04)
                             controller.key_up(direction.value)
-                            
-                            if not interrupted:
-                                time.sleep(0.05) # 短暂硬直，准备下一击
+                            time.sleep(0.05)
             else:
                 if not self.active_hunting:
                     self.state = BrainState.STANDBY

@@ -3,10 +3,10 @@
 This project is a game automation bot built on the **"Single Model Principle"**. Instead of multiple small models for different tasks, it uses a unified "Super Brain" for all entity detection.
 
 ## 🏗️ Core Philosophy
+- **Single Model Principle (V12+ Unified)**: A single high-resolution YOLO model (1280x1280) detects **everything**: Player, Monsters, HP/MP bars, **Platforms**, and **Ropes**. This eliminates synchronization errors between "Brain" and "Terrain" models and drastically reduces GPU overhead.
 - **Agentic-First Design**: The codebase is optimized for AI agents to comprehend, modify, and evolve.
-- **Single Model Principle**: One high-resolution YOLO model (1280x1280) detects Player, Monsters, HP/MP bars, and UI elements. This reduces CPU/GPU overhead and eliminates conflicts between models.
 - **Event-Driven**: Components communicate via the `GlobalBus` and `LocalBus` in `src/state/`.
-- **Hybrid Data**: Combines real screenshots (Snapshots) and synthetic data (Sprites + Random backgrounds) for robust training.
+- **Hybrid Data**: Combines real screenshots (Snapshots), Terrain labels, and synthetic data for robust training.
 
 ## 🧱 Component Breakdown
 
