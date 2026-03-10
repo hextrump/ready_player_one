@@ -85,8 +85,9 @@ class CombatBrain:
     def __init__(self):
         # 1. 核心综合大模型 Super Brain V11 (高清纠偏版)
         self.super_model = None
-        # 尝试不同可能的路径（由于 YOLO 训练时 project 嵌套导致的）
+        # 优先使用 models/ 文件夹下的统一路径 (方便从 GitHub 拉取代码后直接运行)
         possible_paths = [
+            "models/super_brain_v11.pt",
             "runs/detect/super_brain_v11_highres/weights/best.pt",
             "runs/detect/runs/detect/super_brain_v11_highres/weights/best.pt"
         ]
@@ -100,18 +101,25 @@ class CombatBrain:
                 continue
                 
         if self.super_model is None:
-            log.error("无法加载 Super Brain V11，尝试加载旧版备份...")
+            log.error("无法加载 Super Brain V11，尝试加载本地备份...")
             try:
-                self.super_model = YOLO("runs/detect/runs/detect/monster_v19_pig/weights/best.pt")
-                log.info("已切换至旧版 Monster V19 备份模型")
+                # 同样优先 check models
+                self.super_model = YOLO("models/monster_v19.pt")
+                log.info("已切换至 models/monster_v19 备份模型")
             except:
-                log.error("核心识别模型完全不可用！")
+                try:
+                    self.super_model = YOLO("runs/detect/runs/detect/monster_v19_pig/weights/best.pt")
+                    log.info("已切换至 runs/detect 旧版本地路径备份")
+                except:
+                    log.error("核心识别模型完全不可用！")
 
-        # 2. 子系统模型 (保留用于地形或其他特殊需求)
+        # 2. 子系统模型 (地形识别)
         self.terrain_model = None
         try:
-            self.terrain_model = YOLO("runs/detect/runs/detect/terrain_v6_henesys/weights/best.pt")
-            log.info("成功激活 Henesys East 地形 V6")
+            # 优先使用 models 路径
+            terrain_path = "models/terrain_v6.pt" if os.path.exists("models/terrain_v6.pt") else "runs/detect/runs/detect/terrain_v6_henesys/weights/best.pt"
+            self.terrain_model = YOLO(terrain_path)
+            log.info(f"成功激活地形模型: {terrain_path}")
         except:
             log.warning("地形模型加载失败")
             
