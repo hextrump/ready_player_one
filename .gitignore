@@ -4,7 +4,8 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
-.agent/
+# .agent/ (Removing this since we want documentation in GitHub)
+# .agent/
 
 # --- Environment ---
 .venv/
