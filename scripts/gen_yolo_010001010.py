@@ -29,6 +29,7 @@ from PIL import Image, ImageEnhance
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FULL_MAP = PROJECT_ROOT / "data" / "map_db" / "010001010_full.png"
 SPRITES_DIR = PROJECT_ROOT / "data" / "map_db" / "monsters" / "sprites"
+PLAYER_SRC = PROJECT_ROOT / "data" / "player" / "02.png"  # 用户角色 sprite 源位置
 
 OUT = PROJECT_ROOT / "data" / "synthetic_010001010"
 OUT_IMG = OUT / "images"
@@ -118,18 +119,22 @@ def reset_output():
 def load_sprites():
     """加载所有怪物 sprite, 返回 {class_id: [(PIL, w, h), ...] 同 sprite 多帧备用}"""
     cache = {cid: [] for cid in MONSTER_TO_CLASS.values()}
+    # 1. 优先用 data/player/02.png (用户提供, 干净透明背景)
+    if PLAYER_SRC.exists():
+        cache[0].append(Image.open(PLAYER_SRC).convert("RGBA"))
+    # 2. 再扫 SPRITES_DIR 兼容老路径
     for sp in sorted(SPRITES_DIR.glob("*.png")):
         # 文件名: {mob_id}_{Name}.png  或  player_*.png
         name = sp.stem
         # Player sprite: 文件名以 player_ 开头
         if name.startswith("player"):
-            cid = MONSTER_TO_CLASS["player"]
-        else:
-            try:
-                mob_id = name.split("_")[0]
-                cid = MONSTER_TO_CLASS[mob_id]
-            except (KeyError, IndexError):
-                continue
+            # 已通过 PLAYER_SRC 加载, 跳过
+            continue
+        try:
+            mob_id = name.split("_")[0]
+            cid = MONSTER_TO_CLASS[mob_id]
+        except (KeyError, IndexError):
+            continue
         img = Image.open(sp).convert("RGBA")
         cache[cid].append(img)
     return cache

@@ -124,10 +124,13 @@ data/
 
 ### 全图 + Sprite
 ```
-data/map_db/
-├── 010001010_full.png             # 全图 (2218x1870) - 整张地图背景
-└── monsters/
-    └── sprites/{id}_{Name}.png    # 7 种怪物的透明 sprite
+data/
+├── map_db/
+│   ├── 010001010_full.png             # 全图 (2218x1870) - 整张地图背景
+│   └── monsters/
+│       └── sprites/{id}_{Name}.png    # 7 种怪物的透明 sprite (meowdb 下载)
+└── player/
+    └── 02.png                         # 🎮 玩家角色 sprite (用户提供, 透明背景)
 ```
 
 ### 合成数据生成
