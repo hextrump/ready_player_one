@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Map ID Annotator</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: Arial; background: #111; color: #eee; display: flex; height: 100vh; overflow: hidden; }
+
+#sidebar { width: 280px; background: #1a1a1a; padding: 10px; display: flex; flex-direction: column; border-right: 1px solid #333; flex-shrink: 0; }
+#sidebar h2 { font-size: 13px; color: #888; margin-bottom: 8px; }
+#progress { background: #222; padding: 8px; border-radius: 4px; margin-bottom: 10px; font-size: 12px; }
+#progress .bar { background: #0066cc; height: 8px; border-radius: 4px; transition: width 0.3s; margin-top: 4px; }
+#image-list { flex: 1; overflow-y: auto; list-style: none; }
+#image-list li { padding: 5px 8px; cursor: pointer; border-radius: 4px; margin-bottom: 2px; font-size: 11px; color: #ccc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: monospace; }
+#image-list li:hover { background: #333; }
+#image-list li.active { background: #0066cc; color: #fff; }
+#image-list li.annotated { color: #6c6; }
+#image-list li.annotated::before { content: "✓ "; color: #6c6; }
+
+#main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+#toolbar { background: #1a1a1a; padding: 8px 16px; display: flex; gap: 6px; align-items: center; border-bottom: 1px solid #333; flex-shrink: 0; }
+#toolbar input { background: #222; color: #eee; border: 1px solid #444; padding: 6px 10px; border-radius: 4px; font-size: 14px; font-family: monospace; width: 130px; }
+#toolbar button { padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; background: #0066cc; color: #fff; }
+#toolbar button.alt { background: #555; }
+#toolbar .info { margin-left: auto; font-size: 12px; color: #888; }
+
+#content { flex: 1; display: flex; overflow: hidden; }
+
+#preview { flex: 1; display: flex; flex-direction: column; background: #000; overflow: auto; padding: 12px; }
+#preview img { max-width: 100%; height: auto; display: block; margin-bottom: 12px; border: 1px solid #333; }
+#preview .label { color: #888; font-size: 11px; margin-bottom: 4px; }
+
+#mm-panel { width: 320px; background: #1a1a1a; border-left: 1px solid #333; display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0; }
+#mm-panel h3 { font-size: 12px; color: #888; padding: 8px 10px; border-bottom: 1px solid #333; }
+#mm-current { padding: 10px; text-align: center; }
+#mm-current img { max-width: 100%; border: 1px solid #333; }
+#mm-candidates { flex: 1; overflow-y: auto; padding: 4px; display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.mm-cand { cursor: pointer; border: 2px solid transparent; border-radius: 4px; padding: 2px; }
+.mm-cand:hover { border-color: #0066cc; }
+.mm-cand img { width: 100%; display: block; }
+.mm-cand .id { font-size: 10px; color: #888; text-align: center; font-family: monospace; margin-top: 2px; }
+.mm-cand.selected { border-color: #ffcc00; }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <h2>图片列表</h2>
+  <div id="progress">
+    <div id="progress-text">加载中...</div>
+    <div class="bar" id="progress-bar" style="width: 0%"></div>
+  </div>
+  <ul id="image-list"></ul>
+</div>
+
+<div id="main">
+  <div id="toolbar">
+    <input id="map-id-input" placeholder="9 位 map ID" maxlength="9" />
+    <button id="save-btn">保存 [Enter]</button>
+    <button id="clear-btn" class="alt">清除</button>
+    <button id="skip-btn" class="alt">跳过 [→]</button>
+    <span class="info" id="info"></span>
+  </div>
+  <div id="content">
+    <div id="preview">
+      <div class="label">全图预览 (缩放)</div>
+      <img id="full-img" />
+      <div class="label">游戏内 minimap 区域 (top-left)</div>
+      <img id="mm-img" style="max-width: 260px;" />
+    </div>
+    <div id="mm-panel">
+      <h3>meowdb minimap 参考</h3>
+      <div id="mm-current">
+        <div style="color:#888;font-size:11px;margin-bottom:4px">已选:</div>
+        <img id="mm-ref" style="max-width:240px;" />
+        <div id="mm-ref-id" style="font-family:monospace;font-size:13px;color:#ffcc00;margin-top:4px"></div>
+      </div>
+      <div id="mm-candidates"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let images = [];
+let current = null;
+let currentMeta = null;
+let selectedMapId = '';
+
+async function loadList() {
+  const r = await fetch(API + '/api/list');
+  const d = await r.json();
+  images = d.items;
+  document.getElementById('progress-text').textContent =
+    `${d.annotated} / ${d.total} (${(d.annotated*100/d.total).toFixed(1)}%)`;
+  document.getElementById('progress-bar').style.width = (d.annotated*100/d.total) + '%';
+
+  const ul = document.getElementById('image-list');
+  ul.innerHTML = '';
+  for (const item of d.items) {
+    const li = document.createElement('li');
+    li.textContent = item.name + (item.map_id ? ' [' + item.map_id + ']' : '');
+    if (item.annotated) li.classList.add('annotated');
+    li.onclick = () => loadImage(item.name);
+    ul.appendChild(li);
+  }
+
+  // 加载 minimap 缩略图 (前 30 个当参考候选)
+  const cands = document.getElementById('mm-candidates');
+  cands.innerHTML = '';
+  for (const mid of d.map_ids.slice(0, 30)) {
+    const div = document.createElement('div');
+    div.className = 'mm-cand';
+    div.dataset.id = mid;
+    div.innerHTML = `<img src="data:image/png;base64,${(await loadB64(mid)).image}" /><div class="id">${mid}</div>`;
+    div.onclick = () => selectMap(mid);
+    cands.appendChild(div);
+  }
+
+  // 加载第一张未标注的
+  const firstUn = images.find(x => !x.annotated);
+  if (firstUn) loadImage(firstUn.name);
+  else if (images.length) loadImage(images[0].name);
+}
+
+async function loadB64(mid) {
+  const r = await fetch(API + '/api/minimap/' + mid);
+  return await r.json();
+}
+
+async function loadImage(name) {
+  current = name;
+  selectedMapId = '';
+  document.getElementById('map-id-input').value = '';
+  document.getElementById('mm-ref').src = '';
+  document.getElementById('mm-ref-id').textContent = '';
+  document.querySelectorAll('#image-list li').forEach(li => {
+    li.classList.toggle('active', li.textContent.startsWith(name));
+  });
+
+  const r = await fetch(API + '/api/image/' + encodeURIComponent(name));
+  const d = await r.json();
+  currentMeta = d;
+  document.getElementById('full-img').src = 'data:image/jpeg;base64,' + d.full;
+  document.getElementById('mm-img').src = 'data:image/jpeg;base64,' + d.minimap;
+  document.getElementById('info').textContent = name + ' (' + d.width + 'x' + d.height + ')';
+}
+
+async function selectMap(mid) {
+  selectedMapId = mid;
+  document.getElementById('map-id-input').value = mid;
+  document.querySelectorAll('.mm-cand').forEach(el =>
+    el.classList.toggle('selected', el.dataset.id === mid));
+  const d = await loadB64(mid);
+  document.getElementById('mm-ref').src = 'data:image/jpeg;base64,' + d.image;
+  document.getElementById('mm-ref-id').textContent = mid;
+}
+
+async function saveAndNext() {
+  let mid = document.getElementById('map-id-input').value.trim();
+  if (!/^\d{9}$/.test(mid)) {
+    alert('请输入 9 位 map ID');
+    return;
+  }
+  const r = await fetch(API + '/api/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ image_name: current, map_id: mid })
+  });
+  if (!r.ok) {
+    alert('保存失败');
+    return;
+  }
+  // 跳到下一张未标注
+  const idx = images.findIndex(x => x.name === current);
+  for (let i = idx + 1; i < images.length; i++) {
+    if (!images[i].annotated) {
+      images[i].annotated = true;
+      images[i].map_id = mid;
+      loadImage(images[i].name);
+      loadList();
+      return;
+    }
+  }
+  alert('🎉 所有图片已标注完!');
+}
+
+async function clearOne() {
+  if (!confirm('清除当前图片的 map ID?')) return;
+  await fetch(API + '/api/clear', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ image_name: current })
+  });
+  const idx = images.findIndex(x => x.name === current);
+  if (idx >= 0) images[idx].annotated = false;
+  loadList();
+  loadImage(current);
+}
+
+document.addEventListener('keydown', e => {
+  if (e.target.id === 'map-id-input') {
+    if (e.key === 'Enter') saveAndNext();
+    return;
+  }
+  if (e.key === 'Enter') saveAndNext();
+  if (e.key === 'ArrowRight' || e.key === ' ') {
+    const idx = images.findIndex(x => x.name === current);
+    if (idx >= 0 && idx < images.length - 1) loadImage(images[idx + 1].name);
+  }
+  if (e.key === 'ArrowLeft') {
+    const idx = images.findIndex(x => x.name === current);
+    if (idx > 0) loadImage(images[idx - 1].name);
+  }
+});
+
+document.getElementById('save-btn').onclick = saveAndNext;
+document.getElementById('clear-btn').onclick = clearOne;
+document.getElementById('skip-btn').onclick = () => {
+  const idx = images.findIndex(x => x.name === current);
+  if (idx >= 0 && idx < images.length - 1) loadImage(images[idx + 1].name);
+};
+
+loadList();
+</script>
+</body>
+</html>

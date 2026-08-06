@@ -29,8 +29,12 @@ except ImportError:
     raise ImportError("需要安装 pywin32: pip install pywin32")
 
 from src.utils.logger import get_logger
+from src.utils.image_utils import letterbox_array
 
 log = get_logger("window_capture")
+
+# 规范画布尺寸: 匹配训练集, 保证训练/推理输入一致
+CANONICAL_SIZE = (1366, 768)
 
 # === DPI Awareness ===
 # Windows DPI 缩放会导致 GetClientRect 返回缩放后的值（如 1280x720）
@@ -76,14 +80,18 @@ class WindowCapture:
         self,
         process_name: str = "msx.exe",
         window_title: str | None = None,
+        target_size: tuple[int, int] | None = CANONICAL_SIZE,
     ):
         """
         Args:
             process_name: 进程名（用于查找窗口）
             window_title: 窗口标题（备选查找方式）
+            target_size: 输出帧 letterbox 到的尺寸. None = 保持原始客户区尺寸.
+                          默认 (1366, 768), 与训练集一致, 保证训练/推理输入对齐.
         """
         self.process_name = process_name
         self.window_title = window_title
+        self.target_size = target_size
         self._hwnd: int = 0
         self._width: int = 0
         self._height: int = 0
@@ -226,7 +234,15 @@ class WindowCapture:
                 x_offset : x_offset + self._width
             ]
 
-            return client_frame.copy()
+            client_frame = client_frame.copy()
+
+            # letterbox 到规范尺寸 (与训练集一致)
+            if self.target_size is not None:
+                client_frame, _, _, _ = letterbox_array(
+                    client_frame, self.target_size
+                )
+
+            return client_frame
 
     def grab_minimap(self) -> np.ndarray:
         """后台截取小地图区域。"""
@@ -262,6 +278,9 @@ class WindowCapture:
 
     @property
     def window_size(self) -> tuple[int, int]:
+        """返回输出帧尺寸 (letterbox 后, 若启用)"""
+        if self.target_size is not None:
+            return self.target_size
         return (self._width, self._height)
 
     @property

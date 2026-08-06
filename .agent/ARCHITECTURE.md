@@ -1,35 +1,86 @@
 # 🌌 Project Architecture: Ready Player One (v3.1)
 
-This project is a game automation bot built on the **"Single Model Principle"**. Instead of multiple small models for different tasks, it uses a unified "Super Brain" for all entity detection.
+> 游戏自动化 bot. 核心是 **Super Brain** 单一 YOLO 模型, 一致输出 V13 4 类对象.
 
-## 🏗️ Core Philosophy
-- **Single Model Principle (V12+ Unified)**: A single high-resolution YOLO model (1280x1280) detects **everything**: Player, Monsters, HP/MP bars, **Platforms**, and **Ropes**. This eliminates synchronization errors between "Brain" and "Terrain" models and drastically reduces GPU overhead.
-- **Agentic-First Design**: The codebase is optimized for AI agents to comprehend, modify, and evolve.
-- **Event-Driven**: Components communicate via the `GlobalBus` and `LocalBus` in `src/state/`.
-- **Hybrid Data**: Combines real screenshots (Snapshots), Terrain labels, and synthetic data for robust training.
+## 🎯 核心原则: Single Model Principle
 
-## 🧱 Component Breakdown
+一个 YOLO 模型检测游戏中所有关键对象, 输出 V13 四类 (连续 ID 0-3):
 
-### 1. Vision & Perception (`src/perception/`)
-- **`combat_brain.py`**: The central vision hub. It runs inference, filters detections, and maintains a "mental map" of targets.
-- **`hp_monitor.py`**: Specifically tracks HP/MP segments for auto-healing.
-- **`monster_tracker.py`**: Handles ID-to-Target mapping and persistence.
+| ID | Class | 用途 |
+|---|---|---|
+| 0 | Player | 自身定位、路径起点 |
+| 1 | Monster | 目标选择、攻击 |
+| 2 | Platform | NavMesh 水平平台、A* 寻路 |
+| 3 | Rope | 垂直导航 |
 
-### 2. Decision & Brain (`src/brain/`)
-- **`game_controller.py`**: State machine (FSM) that decides whether to Hunt, Patrol, Heal, or Rest.
-- **`auto_healer.py`**: Logic for potion consumption based on vision data.
+**优点**:
+- 推理延迟降低 ~40% (对比多模型并发)
+- 全局 NMS 彻底消除角色与怪物的识别冲突
+- 训练/标注/部署三方类别一致, 无 remap 开销
 
-### 3. Navigation (`src/navigation/`)
-- **`pathfinder.py`**: Simple A* or platform-based pathfinding.
-- **`nav_mesh.py`**: Represents the platform structure of the current map.
+HP/MP 不再由 YOLO 识别, 改由 `hp_monitor.py` 直接读取像素颜色 (更精确, 实时).
 
-### 4. Hardware Interaction (`src/capture/` & `src/navigation/action_translator.py`)
-- **`window_capture.py`**: High-speed DXCAM or Window-handle based frame grabbing.
-- **`action_translator.py`**: Converts logic "Move Left" into virtual key presses (`pydirectinput`).
+## 🧱 组件
 
-## 📡 Communication Flow
-1. `WindowCapture` -> Latest Frame.
-2. `CombatBrain` -> inference (YOLO) -> `PerceptionData`.
-3. `PerceptionData` -> `GlobalBus` (Broadcast).
-4. `GameController` -> Consumes Events -> Decide Action.
-5. `ActionTranslator` -> Key Press.
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        main.py                              │
+└─────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  AgentV5 (orchestrator)                     │
+└─────┬───────────┬───────────┬───────────┬───────────────────┘
+      ▼           ▼           ▼           ▼
+┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐
+│  See     │ │  Act     │ │  Heal    │ │  Think+Sense │
+│ Window   │ │ Game     │ │ Auto     │ │ CombatBrain  │
+│ Capture  │ │ Control- │ │ Healer + │ │   +          │
+│          │ │ ler      │ │ HP       │ │   YOLO       │
+│          │ │          │ │ Monitor  │ │ (Super Brain)│
+└──────────┘ └──────────┘ └──────────┘ └──────────────┘
+```
+
+### 1. See (`src/capture/`)
+- `window_capture.py`: PrintWindow/DXGI 后台截屏 1600x900
+
+### 2. Act (`src/brain/`)
+- `game_controller.py`: DirectInput 后台注入 Scan Code
+
+### 3. Heal (`src/brain/` + `src/perception/`)
+- `hp_monitor.py`: 像素级 HP/MP 颜色检测 (不依赖 YOLO)
+- `auto_healer.py`: HP<0.5 自动喝红, MP<0.3 自动喝蓝
+
+### 4. Think + Sense (`src/brain/` + `src/perception/`)
+- `combat_brain.py`: FSM 状态机 (scan → approach → attack → loot → patrol)
+- 加载 `models/super_brain.pt`, 调用 YOLO 推理, 输出 PerceptionData
+
+## 📡 数据流
+
+```
+WindowCapture ──frame──▶ CombatBrain
+                            │
+                            ▼
+                       YOLO inference
+                            │
+                            ▼
+                  PerceptionData (Player/Monster/Platform/Rope)
+                            │
+                            ▼
+                  GlobalBus (broadcast)
+                            │
+                ┌───────────┼───────────┐
+                ▼           ▼           ▼
+          GameController  AutoHealer  Pathfinder
+```
+
+## 📦 训练相关
+
+- 训练数据: `data/auto_dataset/` (5949 张, V13 0-3 标注)
+- 训练脚本: `train_super_brain.py`
+- 构建脚本: `scripts/build_dataset.py`
+- 标注工具: `tools/web_annotator.py`
+- 模型输出: `runs/detect/super_brain/weights/best.pt`
+- 部署位置: `models/super_brain.pt`
+
+详见 `.agent/EVOLUTION.md` 和 `.agent/OPERATIONS.md`.

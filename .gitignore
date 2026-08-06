@@ -4,8 +4,6 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
-# .agent/ (Removing this since we want documentation in GitHub)
-# .agent/
 
 # --- Environment ---
 .venv/
@@ -13,21 +11,25 @@ env/
 venv/
 .env
 
-# --- YOLO Runtime Data (非常大，不建议传 GitHub) ---
-# data 文件夹目前有 5.7GB，严禁上传到 GitHub
+# --- YOLO 数据集 & 训练输出 ---
+# 数据集非常大, 不入仓
 data/
+runs/
+train.log
+check_output/
 
 # --- Logs ---
 logs/
 
-# --- MODELS & WEIGHTS (关键建议) ---
-# GitHub 对超过 50MB 的文件会有警告。
-# 虽然 yolov8n.pt 很小，但训练过程产生的文件非常多，建议排除 runs
-runs/
+# --- Models ---
+# 模型权重不入仓 (单独云同步或 LFS)
+models/
+*.pt
+*.onnx
+*.engine
 
-# --- 如果你想同步权重到 GitHub，可以取消下面这一行的注释 ---
-# !runs/detect/*/weights/best.pt
+# --- Claude Code 配置 ---
+.claude/
 
 # --- User Config ---
-# 包含本地路径，不建议同步
 config.yaml
