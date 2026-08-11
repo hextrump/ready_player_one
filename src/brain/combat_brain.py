@@ -30,7 +30,7 @@ from src.brain.game_controller import GameController, Direction
 from src.brain.patrol_mover import PatrolMover
 from src.perception.hp_monitor import HPMonitor
 from src.brain.data_collector import DataCollector
-from src.perception.nametag_locator import NametagLocator, NAMETAG_MATCH_THRESHOLD
+from src.perception.nametag_hsv_locator import NametagHSVLocator, NAMETAG_SCORE_OK_THRESHOLD as NAMETAG_MATCH_THRESHOLD
 from src.utils.logger import get_logger
 
 log = get_logger("combat_brain")
@@ -160,10 +160,10 @@ class CombatBrain:
         self._player_miss_frames = 0  # 玩家连续漏检帧计数 (用于位置衰减)
         self._player_pending = None   # 名牌大位移候选 (等两帧确认, 防锁到其它玩家名牌)
 
-        # ── 感知加固: 名牌硬比对定位器 (V19 无 Player 类, 玩家位置全靠它) ──
-        self.nametag_locator = NametagLocator()
+        # ── 感知加固: 名牌 HSV 定位器 (无模板, 多人场景选最靠下) ──
+        self.nametag_locator = NametagHSVLocator()
         if not self.nametag_locator.available:
-            log.warning("[PLAYER] 名牌模板缺失! 玩家位置将固定在初始猜测 (请运行 tools/capture_nametag.py 生成模板+偏移)")
+            log.warning("[PLAYER] 名牌定位器不可用! 玩家位置将固定在初始猜测")
 
     def _perception_loop(self, capture: WindowCapture):
         """后台视觉线程：维持一秒看3-5次的高度警觉"""
@@ -583,11 +583,9 @@ class CombatBrain:
             ok_str = "OK" if nl.last_score < NAMETAG_MATCH_THRESHOLD else "MISS"
             cv2.putText(vis_frame, f"NAMETAG {ok_str} score={nl.last_score:.2f}",
                         (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(vis_frame, f"OFFSET ({nl.offset_x},{nl.offset_y})",
-                        (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            if not self.active_hunting:
-                cv2.putText(vis_frame, "STANDBY: 方向键微调 offset, O 保存",
-                            (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 2)
+            # HSV 版本无 offset (无模板, 偏移硬编码在 HEAD_OFFSET_Y)
+            cv2.putText(vis_frame, "HSV locator (no template needed)",
+                        (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         # 处理 HP/MP 显示
         if hp_monitor:
@@ -626,20 +624,9 @@ class CombatBrain:
         return cv2.waitKey(1)
 
     def _handle_vision_key(self, key: Optional[int]) -> None:
-        """名牌 offset 微调快捷键 (仅待命时, 避免战斗中改位): 方向键微调, O 保存。"""
-        nl = self.nametag_locator
-        if key is None or not nl.available or self.active_hunting:
-            return
-        if key == 0x260000:          # ↑
-            nl.adjust_offset(0, -2)
-        elif key == 0x280000:        # ↓
-            nl.adjust_offset(0, 2)
-        elif key == 0x250000:        # ←
-            nl.adjust_offset(-2, 0)
-        elif key == 0x270000:        # →
-            nl.adjust_offset(2, 0)
-        elif (key & 0xFF) == ord('o'):
-            nl.save_offset()
+        """HSV 版本无 offset 调节 (无模板依赖), 此方法留空避免战斗中误改。"""
+        # 模板匹配版的快捷键已废弃 (改用 HSV 检测, 偏移硬编码在 HEAD_OFFSET_Y)
+        return
 
     def stop(self):
         self._running = False
