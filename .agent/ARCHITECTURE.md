@@ -1,86 +1,38 @@
-# 🌌 Project Architecture: Ready Player One (v3.1)
+# 🌌 Project Architecture: Ready Player One (v7)
 
-> 游戏自动化 bot. 核心是 **Super Brain** 单一 YOLO 模型, 一致输出 V13 4 类对象.
+MapleStory auto-hunting bot. Detection = **YOLO V19 单类怪模型 + 名牌模板匹配定位玩家**;
+决策 = **贪心战斗循环（无 NavMesh）**。决策结构参考 MapleStoryAutoLevelUp，
+检测用更强的 YOLO。
 
-## 🎯 核心原则: Single Model Principle
+## 🏗️ Core Philosophy
+- **V19 Single-Class Model**: `models/monster_v19.pt` 是单类 YOLO（`{0: Monster}`）。
+  专注怪检测，比旧的多类 "Super Brain" 更简单、更准，也省显存。
+- **Player via Nametag**: V19 无 Player 类，玩家位置由 `src/perception/nametag_locator.py`
+  模板匹配玩家静态名牌锚定，带合理性门控 + 漏检向画面中心衰减。
+- **Greedy Decision (no NavMesh)**: 主循环"有怪在范围→打；否则朝最近怪贪心走；没怪→巡逻"。
+  NavMesh / A* / 地形模型子系统已移除；多层靠跳发补刀 + 登台跳启发式 + 脱困跳兜底。
+- **Eye-Hand Separation**: 后台视觉线程（~7fps）写共享感知缓存，主循环读缓存做动作，互不阻塞。
 
-一个 YOLO 模型检测游戏中所有关键对象, 输出 V13 四类 (连续 ID 0-3):
+## 🧱 Component Breakdown
 
-| ID | Class | 用途 |
-|---|---|---|
-| 0 | Player | 自身定位、路径起点 |
-| 1 | Monster | 目标选择、攻击 |
-| 2 | Platform | NavMesh 水平平台、A* 寻路 |
-| 3 | Rope | 垂直导航 |
+### 1. Capture (`src/capture/`)
+- **`window_capture.py`**: 后台 BitBlt 抓帧、窗口查找与 resize。
 
-**优点**:
-- 推理延迟降低 ~40% (对比多模型并发)
-- 全局 NMS 彻底消除角色与怪物的识别冲突
-- 训练/标注/部署三方类别一致, 无 remap 开销
+### 2. Perception (`src/perception/`)
+- **`hp_monitor.py`**: 追踪 HP/MP 条，供自动喝药。
+- **`nametag_locator.py`**: 多尺度模板匹配玩家名牌 → 玩家坐标。
 
-HP/MP 不再由 YOLO 识别, 改由 `hp_monitor.py` 直接读取像素颜色 (更精确, 实时).
+### 3. Brain (`src/brain/`)
+- **`combat_brain.py`**: 中枢（感知 + 决策）。跑 V19 推理、锚定玩家位置、
+  选目标（范围内优先，否则最近）、驱动 攻击/贪心靠近/巡逻，并启动后台视觉线程。
+- **`game_controller.py`**: 底层后台键盘输入（AttachThreadInput + keybd_event）。
+- **`auto_healer.py`**: 独立 HP/MP 药水线程，读 `hp_monitor` 血量。
+- **`data_collector.py`**: 定期心跳截图保存，供模型再训练。
 
-## 🧱 组件
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        main.py                              │
-└─────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  AgentV5 (orchestrator)                     │
-└─────┬───────────┬───────────┬───────────┬───────────────────┘
-      ▼           ▼           ▼           ▼
-┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐
-│  See     │ │  Act     │ │  Heal    │ │  Think+Sense │
-│ Window   │ │ Game     │ │ Auto     │ │ CombatBrain  │
-│ Capture  │ │ Control- │ │ Healer + │ │   +          │
-│          │ │ ler      │ │ HP       │ │   YOLO       │
-│          │ │          │ │ Monitor  │ │ (Super Brain)│
-└──────────┘ └──────────┘ └──────────┘ └──────────────┘
-```
-
-### 1. See (`src/capture/`)
-- `window_capture.py`: PrintWindow/DXGI 后台截屏 1600x900
-
-### 2. Act (`src/brain/`)
-- `game_controller.py`: DirectInput 后台注入 Scan Code
-
-### 3. Heal (`src/brain/` + `src/perception/`)
-- `hp_monitor.py`: 像素级 HP/MP 颜色检测 (不依赖 YOLO)
-- `auto_healer.py`: HP<0.5 自动喝红, MP<0.3 自动喝蓝
-
-### 4. Think + Sense (`src/brain/` + `src/perception/`)
-- `combat_brain.py`: FSM 状态机 (scan → approach → attack → loot → patrol)
-- 加载 `models/super_brain.pt`, 调用 YOLO 推理, 输出 PerceptionData
-
-## 📡 数据流
-
-```
-WindowCapture ──frame──▶ CombatBrain
-                            │
-                            ▼
-                       YOLO inference
-                            │
-                            ▼
-                  PerceptionData (Player/Monster/Platform/Rope)
-                            │
-                            ▼
-                  GlobalBus (broadcast)
-                            │
-                ┌───────────┼───────────┐
-                ▼           ▼           ▼
-          GameController  AutoHealer  Pathfinder
-```
-
-## 📦 训练相关
-
-- 训练数据: `data/auto_dataset/` (5949 张, V13 0-3 标注)
-- 训练脚本: `train_super_brain.py`
-- 构建脚本: `scripts/build_dataset.py`
-- 标注工具: `tools/web_annotator.py`
-- 模型输出: `runs/detect/super_brain/weights/best.pt`
-- 部署位置: `models/super_brain.pt`
-
-详见 `.agent/EVOLUTION.md` 和 `.agent/OPERATIONS.md`.
+## 📡 Flow
+1. `WindowCapture.grab()` → frame。
+2. 感知线程: `CombatBrain.find_targets()` → V19 怪框 + 名牌玩家坐标 → 共享缓存。
+3. 主循环: `select_target()` → 在攻击范围? `_attack()`（burst/跳发）:
+   `_approach()`（贪心走 + 登台/下跳启发式 + 脱困跳）: 无怪 → `_patrol()`。
+4. `GameController` 注入键盘扫描码。
+5. `AutoHealer` 独立喝药。

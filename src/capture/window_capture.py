@@ -236,6 +236,21 @@ class WindowCapture:
 
             client_frame = client_frame.copy()
 
+            # 8. PrintWindow 对某些 DX 游戏会整屏返回黑, 或返回"内容+右侧黑边"的残缺帧
+            #    → 检测大面积近黑像素 (>25%) 就回退 BitBlt 屏幕截图 (需窗口可见/在前台)
+            black_ratio = float((client_frame.mean(axis=2) < 10).mean())
+            if black_ratio > 0.25:
+                try:
+                    client_frame = self._grab_bitblt()
+                    if not getattr(self, '_last_grab_was_fallback', False):
+                        log.info(f"PrintWindow 黑屏/黑边(占比 {black_ratio:.0%}), 已回退 BitBlt 屏幕截图")
+                    self._last_grab_was_fallback = True
+                except Exception as e:
+                    log.warning(f"PrintWindow 黑屏且 BitBlt 兜底失败: {e}")
+                    self._last_grab_was_fallback = False
+            else:
+                self._last_grab_was_fallback = False
+
             # letterbox 到规范尺寸 (与训练集一致)
             if self.target_size is not None:
                 client_frame, _, _, _ = letterbox_array(
@@ -243,6 +258,44 @@ class WindowCapture:
                 )
 
             return client_frame
+
+    def _grab_bitblt(self) -> np.ndarray:
+        """从屏幕 DC 截取整个窗口 (PrintWindow 返回黑屏时的兜底)。
+
+        需要窗口可见且未被完全遮挡; 返回客户区 BGR。
+        注意: 与 PrintWindow 不同, 窗口被完全遮挡时截到的是遮挡窗口的内容。
+        """
+        win_rect = win32gui.GetWindowRect(self._hwnd)
+        win_w = win_rect[2] - win_rect[0]
+        win_h = win_rect[3] - win_rect[1]
+
+        screen_dc = win32gui.GetDC(0)
+        try:
+            mfc_dc = win32ui.CreateDCFromHandle(screen_dc)
+            mem_dc = mfc_dc.CreateCompatibleDC()
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(mfc_dc, win_w, win_h)
+            old_bitmap = mem_dc.SelectObject(bitmap)
+            mem_dc.BitBlt((0, 0), (win_w, win_h), mfc_dc,
+                          (win_rect[0], win_rect[1]), win32con.SRCCOPY)
+            bmp_info = bitmap.GetInfo()
+            bits = bitmap.GetBitmapBits(True)
+            mem_dc.SelectObject(old_bitmap)
+            win32gui.DeleteObject(bitmap.GetHandle())
+            mem_dc.DeleteDC()
+            # mfc_dc 由 GetDC 派生, 不 DeleteDC, 只 ReleaseDC 底层句柄
+        finally:
+            win32gui.ReleaseDC(0, screen_dc)
+
+        full_frame = np.frombuffer(bits, dtype=np.uint8)
+        full_frame = full_frame.reshape(
+            (bmp_info["bmHeight"], bmp_info["bmWidth"], 4))[:, :, :3].copy()
+
+        client_point = win32gui.ClientToScreen(self._hwnd, (0, 0))
+        x_offset = client_point[0] - win_rect[0]
+        y_offset = client_point[1] - win_rect[1]
+        return full_frame[y_offset:y_offset + self._height,
+                          x_offset:x_offset + self._width].copy()
 
     def grab_minimap(self) -> np.ndarray:
         """后台截取小地图区域。"""
@@ -271,6 +324,36 @@ class WindowCapture:
                 log.info("游戏窗口已前置")
             except Exception as e:
                 log.warning(f"窗口前置失败: {e}")
+
+    def resize_window(self, client_w: int, client_h: int) -> None:
+        """把游戏窗口客户区强制 resize 到指定尺寸 (参考 MapleStoryAutoLevelUp 的 auto_resize)。
+
+        目的: 固定窗口尺寸 → 帧尺寸稳定、坐标常量有效、避免窗口过大/出屏导致"视频超出"。
+        若客户区已是目标尺寸则跳过。
+        """
+        if not self._hwnd or not win32gui.IsWindow(self._hwnd):
+            return
+        self._update_size()
+        if self._width == client_w and self._height == client_h:
+            return
+        try:
+            wr = win32gui.GetWindowRect(self._hwnd)
+            # 窗口尺寸 = 客户区 + 边框/标题栏 (当前差值不变)
+            win_w = client_w + (wr[2] - wr[0]) - self._width
+            win_h = client_h + (wr[3] - wr[1]) - self._height
+            # 保证窗口在屏幕内 (左缘出屏时拉回)
+            x, y = wr[0], wr[1]
+            if x < 0:
+                x = 0
+            if y < 0:
+                y = 0
+            win32gui.SetWindowPos(self._hwnd, None, x, y, win_w, win_h,
+                                  win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+            time.sleep(0.1)
+            self._update_size()
+            log.info(f"游戏窗口已 resize 到客户区 {self._width}x{self._height}")
+        except Exception as e:
+            log.warning(f"窗口 resize 失败: {e}")
 
     @property
     def hwnd(self) -> int:

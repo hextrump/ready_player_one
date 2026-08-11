@@ -1,43 +1,28 @@
-# 📂 Directory Map
+# 📂 Directory Map: Multi-Device Sync (Agentic)
+
+Wait... How do I sync this project between a powerful Training PC and a mobile Laptop?
 
 ## 📁 Git-Tracked (Always Synced)
-- **`src/`**: Bot 业务代码 (window capture, brain, perception, navigation, image_utils)
-- **`scripts/`**: 数据集构建 (`build_dataset.py`), 迁移 (`migrate_labels.py`, `resize_dataset.py`)
-- **`tools/`**: 标注 & 可视化 (`web_annotator.py`, `check_auto_dataset.py`, `web_annotator.html`)
-- **`models/`**: 训练好的权重 (云同步或 LFS)
-- **`.agent/`**: 文档与演进指引
-- **`plan.md`**: 项目路线图
-- **`train_super_brain.py`**: 训练入口
-- **`main.py`**: Bot 启动入口
-- **`generate_yolo_data.py`**: 合成数据生成器 (可选)
+- **`src/`**: Shared brain code.
+- **`models/`**: V19 单类怪模型 (`monster_v19.pt`) + 名牌模板/偏移 (`nametag/`)；旧多类模型 (`super_brain_*`) 已弃用但保留存档。
+- **`.agent/`**: The documentation and evolution instructions (this folder!).
+- **`config.yaml`**: The shared configuration.
+- **`plan.md`**: Roadmap and progress.
 
-## 📁 Git-Ignored (本地管理)
-- **`data/auto_dataset/`**: 唯一原始数据源 (1366×768 jpg + V13 0-3 labels)
-- **`data/super_brain_train/`**: 训练集派生 (运行 `build_dataset.py` 自动生成)
-- **`runs/`**: YOLO 训练输出
-- **`train.log`**: 训练日志
-- **`logs/`**: 运行日志
-- **`.venv/`**: Python 环境
+## 📁 Git-Ignored (Not Synced, Locally Managed)
+- **`data/`**: Large raw datasets (5.8GB+).
+- **`runs/`**: Intermediate training logs/weights.
+- **`logs/`**: Local runtime logs.
+- **`archive/`**: Obsolete/Experiment scripts.
 
-## 📐 规范画布
+## 🔄 The Sync Workflow
+To move the bot to a new computer (Laptop):
+1. **Pull Code**: `git pull origin main`.
+2. **Setup Dependencies**: `pip install -r requirements.txt`.
+3. **Move Data (Optional)**: Move `data/monster_db/` (sprites) and `data/entity/snapshots/` (samples) via a USB/Network drive to enable local training.
+4. **Boot Up**: `python main.py` (Wait for `monster_v19.pt` to load).
 
-**1366×768** 是统一画布, 训练集、运行时抓帧、标注器都按这个尺寸工作.
-详见 `src/utils/image_utils.py` 的 `CANONICAL_SIZE`.
-
-## 🔄 新机器部署流程
-
-1. `git pull origin main`
-2. `pip install -r requirements.txt`
-3. 把 `data/auto_dataset/` (4.6GB) 通过 USB/网盘同步过来
-4. `python scripts/build_dataset.py` 构建训练集
-5. `python train_super_brain.py` 训练 (或直接用已同步的 `models/super_brain.pt`)
-6. `python main.py` 启动 bot
-
-## 🏷️ V13 类别速查
-
-| ID | Class | HTML | BGR |
-|---|---|---|---|
-| 0 | Player | `#0066cc` | (255, 0, 0) |
-| 1 | Monster | `#cc0000` | (0, 0, 255) |
-| 2 | Platform | `#00aa00` | (0, 255, 0) |
-| 3 | Rope | `#00aaaa` | (255, 255, 0) |
+## 🚀 Future Scalability
+- **Map Addition**: 贪心移动 + 跳跃启发式已适配大部分图；复杂多层图靠跳发补刀/登台跳/脱困跳兜底，无需每图建导航。
+- **UI Expansion**: 如需 UI 元素检测，可给 `monster_v19.pt` 重训加入类，或新增专门小模型。
+- **Bot Behavior**: 针对不同职业的战斗逻辑可做 `CombatBrain` 子类或策略参数化。

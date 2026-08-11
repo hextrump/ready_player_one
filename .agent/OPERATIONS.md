@@ -1,98 +1,49 @@
 # 🎮 Bot Operations & Debugging Guide
 
-## 📐 规范画布: 1366×768
+This guide is for starting the bot, monitoring its health, and troubleshooting common issues.
 
-训练集、运行时抓帧、标注器全部按 1366×768 工作.
-游戏窗口分辨率不重要 — `WindowCapture` 会自动 letterbox 到 1366×768.
-
-## 🏁 启动
-
+## 🏁 How to Start
 ```powershell
-conda activate py313    # 或激活项目 venv
+# 1. Activate Environment
+conda activate py313
+
+# 2. Run Main Bot
 python main.py
 ```
 
-## ⌨️ 运行时热键
+## 📊 Monitoring Health
+- **Live Logs**: Check `logs/agent.log` for logic errors (e.g., "ATTACK", "脱困跳", "PATROL").
+- **Visual Check**:
+  - The bot displays its perception window by default.
+  - Red cross: Player position (from nametag).
+  - Orange boxes: Monsters (V19 detections).
+  - Green box: Nametag match.
+  - Red/Blue bars: HP/MP detection.
 
-| 按键 | 作用 |
-|---|---|
-| F1 | 启用自动挂机 |
-| F | 停止挂机 (standby) |
-| Ctrl+C | 完全退出 |
+## 🛠️ Common Issues & Fixes
 
-## 📊 监控
+### Issue: Player misidentified as a Monster
+- **Cause**: V19 会把玩家自己误检成 Monster。
+- **Fix**:
+  1. 采集名牌模板/偏移 (`tools/capture_nametag.py`), 确保名牌定位可用。
+  2. 收集误检样本, 重训 `monster_v19.pt` (见 `EVOLUTION.md`)。
+- **Logic Safeguard**: `CombatBrain.find_targets` 过滤掉与玩家已确认位置重叠 >30% 的怪框。
 
-- **运行日志**: `logs/combat_bot.log`
-- **可视化窗口**: bot 默认弹出 perception 窗口
-  - 🟦 蓝框 = Player (0)
-  - 🟥 红框 = Monster (1)
-  - 🟩 绿框 = Platform (2)
-  - 🟨 青框 = Rope (3)
+### Issue: Bot is "lagging" or FPS is low
+- **Cause**: YOLO 推理或抓帧占用 GPU/CPU。
+- **Fix**:
+  - 主模型 `imgsz=640` 已够 (V19 单类怪, 不需要 1280 超清)。
+  - Ensure `torch.cuda.is_available()` is true.
+  - 后台视觉线程 ~7fps; 若仍卡, 检查抓帧是否被其他窗口遮挡。
 
-## 🔄 训练 / 再训练
+### Issue: Bot doesn't move or use skills
+- **Cause**: 后台键盘注入失败或贪心移动卡死。
+- **Fix**:
+  - Ensure game window is visible (not minimized) and script runs with administrative privileges.
+  - 卡在台阶时观察"脱困跳"日志是否触发; 若多层图频繁卡住, 设 `FLAT_MODE=True` 或换平层图。
+  - 按键绑定在 `src/brain/game_controller.py` (SCAN/VK 表); `config.yaml` 仅文档性配置。
 
-```powershell
-# 1. 标注 (可选)
-python tools/web_annotator.py
-
-# 2. 构建训练集
-python scripts/build_dataset.py
-
-# 3. 训练
-python train_super_brain.py
-
-# 4. 部署
-cp runs/detect/super_brain/weights/best.pt models/super_brain.pt
-```
-
-详见 `.agent/EVOLUTION.md`.
-
-## 🔄 换游戏分辨率
-
-```python
-# 1. 改 src/utils/image_utils.py 的 CANONICAL_SIZE
-# 2. 改 src/capture/window_capture.py 的 CANONICAL_SIZE (与 1 保持一致)
-
-# 3. 重做训练集 (letterbox 所有图到新尺寸)
-python scripts/resize_dataset.py --backup
-
-# 4. 重建 + 重训
-python scripts/build_dataset.py
-python train_super_brain.py
-```
-labels 不需要改 (归一化坐标).
-
-## 🛠️ 常见问题
-
-### Player 被误识别为 Monster
-- `tools/check_auto_dataset.py --limit 30` 看标注
-- `tools/web_annotator.py` 用 Delete 模式微调 Player 框
-- 重跑 build + train
-
-### Bot 延迟高 / FPS 低
-- `train_super_brain.py` 里降 `imgsz` (e.g. 640)
-- 确认 `torch.cuda.is_available()` 为 true
-
-### Bot 不动 / 不放技能
-- 游戏窗口需要管理员权限
-- 检查 `config.yaml` 键位映射
-
-## 🧪 测试
-
-```powershell
-pytest tests/test_perception.py
-python tests/test_fsm.py
-```
-
-## 🗺️ meowdb 数据 (B 方案)
-
-```powershell
-# 下载 minimap 库 + 索引 (一次性)
-.venv/Scripts/python.exe scripts/build_map_db.py --all
-
-# 手工标 map ID
-.venv/Scripts/python.exe tools/web_map_id.py    # http://localhost:8081
-
-# 比对 (待做) YOLO vs meowdb
-.venv/Scripts/python.exe scripts/compare_vision.py <image>
-```
+## 🧪 Testing
+- **冒烟测试**: `python -c "from src.brain.combat_brain import CombatBrain; b = CombatBrain()"` — 确认 V19 加载、无 import 报错。
+- **实机验证**: `python main.py` (或 `--process <exe>`) → F1 开打, 观察"打怪/靠近/巡逻"三态 + 名牌校准 HUD。
+- 注: `tests/` 下现有测试是旧 event-driven 架构的遗留, 引用已不存在的模块 (yolo_detector 等), 暂不可用。

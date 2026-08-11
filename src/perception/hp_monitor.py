@@ -1,9 +1,17 @@
 """
-Precise HSV Color-Masking HP/MP Monitor — V5.1
-Pure OpenCV approach: contour-based calibration + pixel-level percentage reading.
-No YOLO dependency for UI detection.
-"""
+HP/MP 识别 — 参考 MapleStoryAutoLevelUp (HealthMonitor + get_bar_percent)
+================================================================================
+关键思想 (借鉴参考项目):
+  1. 中心行读数: 取条中央水平线, 填充=彩色像素, 空余=浅灰 (R≈G≈B) 像素
+     填充比 = 彩色 / (彩色 + 浅灰)  → 任意血量都准, 无需校准满值
+  2. 条的全宽由"彩色填充 + 浅灰空余"的连续段确定, 不依赖固定宽度
 
+适配: 参考项目用白边框条, 我们是"彩色填充 + 浅灰空余"的条, 结构一致故可直接套用。
+     喝药只依赖 HP/MP, 校准只要求这两条 (EXP 尽力检测不阻塞)。
+
+接口保持与旧版一致 (VitalStats / read / calibrate / hp_bbox / mp_bbox / last_hp_mask / last_mp_mask),
+AutoHealer 与 viz 无需改动。
+"""
 import time
 import os
 from dataclasses import dataclass
@@ -12,7 +20,7 @@ import cv2
 
 from src.utils.logger import get_logger
 
-log = get_logger("hp_monitor_v5")
+log = get_logger("hp_monitor")
 
 @dataclass
 class VitalStats:
@@ -39,154 +47,133 @@ class HPMonitor:
     ):
         self.hp_threshold = hp_critical_threshold
         self.mp_threshold = mp_critical_threshold
-        
-        self.hp_template_path = 'data/ui/hp_image.png'
-        self.mp_template_path = 'data/ui/mp_image.png'
 
         self.is_calibrated = False
-
-        # Baseline max values from 100% templates
-        self.hp_max_pixels = 0
-        self.hp_max_width = 0
-        self.mp_max_pixels = 0
-        self.mp_max_width = 0
-        
-        # Absolute screen regions for UI bars
         self.hp_bbox = (0, 0, 0, 0)
         self.mp_bbox = (0, 0, 0, 0)
-        
-        # We auto-calibrate on init if templates exist
-        self._init_calibration()
+        self.exp_bbox = (0, 0, 0, 0)
 
-    def _get_mask(self, img_hsv, bar_type):
+        # 可视化用 (保持旧接口)
+        self.last_hp_mask = None
+        self.last_mp_mask = None
+
+    # ── 颜色掩膜: 各条的专属填充色 (HP红 / MP蓝 / EXP黄) ──
+    def _get_color_mask(self, img_hsv, bar_type):
         if bar_type == 'HP':
-            # Red color ranges (wrap around in HSV)
-            lower_red1 = np.array([0, 100, 100])
-            upper_red1 = np.array([10, 255, 255])
-            lower_red2 = np.array([170, 100, 100])
-            upper_red2 = np.array([179, 255, 255])
-            mask1 = cv2.inRange(img_hsv, lower_red1, upper_red1)
-            mask2 = cv2.inRange(img_hsv, lower_red2, upper_red2)
-            return mask1 + mask2
+            m1 = cv2.inRange(img_hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
+            m2 = cv2.inRange(img_hsv, np.array([170, 100, 100]), np.array([179, 255, 255]))
+            return m1 + m2
         elif bar_type == 'MP':
-            # Blue color ranges
-            lower_blue = np.array([100, 100, 100])
-            upper_blue = np.array([130, 255, 255])
-            return cv2.inRange(img_hsv, lower_blue, upper_blue)
+            return cv2.inRange(img_hsv, np.array([100, 100, 100]), np.array([130, 255, 255]))
+        elif bar_type == 'EXP':
+            return cv2.inRange(img_hsv, np.array([15, 100, 100]), np.array([40, 255, 255]))
         return None
 
-    def _init_calibration(self):
-        """Calibrate maximum pixels/width from the local 100% template images"""
-        # HP Calib
-        if os.path.exists(self.hp_template_path):
-            img = cv2.imread(self.hp_template_path)
-            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-            mask = self._get_mask(hsv, 'HP')
-            self.hp_max_pixels = cv2.countNonZero(mask)
-            _, _, self.hp_max_width, _ = cv2.boundingRect(mask)
-            log.info(f"Loaded HP Template: Max Pix={self.hp_max_pixels}, Max W={self.hp_max_width}")
-            
-        # MP Calib
-        if os.path.exists(self.mp_template_path):
-            img = cv2.imread(self.mp_template_path)
-            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-            mask = self._get_mask(hsv, 'MP')
-            self.mp_max_pixels = cv2.countNonZero(mask)
-            _, _, self.mp_max_width, _ = cv2.boundingRect(mask)
-            log.info(f"Loaded MP Template: Max Pix={self.mp_max_pixels}, Max W={self.mp_max_width}")
-
-    def calibrate(self, frame: np.ndarray):
-        """
-        Dynamically find the bar bounding boxes using HSV color contours.
-        Filters by aspect ratio (bars are wide and thin) and only checks 
-        the bottom 40% of the screen to avoid locking onto UI buttons.
-        """
-        h_img, w_img = frame.shape[:2]
-        roi_top = int(h_img * 0.6)
-        
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        
-        # ---------------- HP Bar ----------------
-        hp_mask = self._get_mask(hsv, 'HP')
-        hp_mask[:roi_top, :] = 0
-        
-        contours, _ = cv2.findContours(hp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid_hp = []
-        for c in contours:
-            x, y, cw, ch = cv2.boundingRect(c)
-            if ch > 0 and (cw / ch) > 3.0 and cw > 50:
-                valid_hp.append(c)
-                
-        if valid_hp:
-            largest = max(valid_hp, key=cv2.contourArea)
-            self.hp_bbox = cv2.boundingRect(largest)
-            log.info(f"Calibrated HP BBox: {self.hp_bbox} (Ratio: {self.hp_bbox[2]/self.hp_bbox[3]:.1f})")
-        else:
-            log.warning("Failed to find HP bar!")
-
-        # ---------------- MP Bar ----------------
-        mp_mask = self._get_mask(hsv, 'MP')
-        mp_mask[:roi_top, :] = 0
-        
-        valid_mp = []
-        contours, _ = cv2.findContours(mp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours:
-            x, y, cw, ch = cv2.boundingRect(c)
-            if ch > 0 and (cw / ch) > 3.0 and cw > 50:
-                valid_mp.append(c)
-                
-        if valid_mp:
-            largest = max(valid_mp, key=cv2.contourArea)
-            self.mp_bbox = cv2.boundingRect(largest)
-            log.info(f"Calibrated MP BBox: {self.mp_bbox} (Ratio: {self.mp_bbox[2]/self.mp_bbox[3]:.1f})")
-        else:
-            log.warning("Failed to find MP bar!")
-
-        self.is_calibrated = True
-
-    def _read_bar_percentage(self, frame: np.ndarray, bbox: tuple, bar_type: str, max_w: int, max_p: int) -> float:
-        x, y, w, h = bbox
-        if w <= 0 or h <= 0:
-            return 1.0
-            
-        pad = 5
-        y1, y2 = max(0, y-pad), min(frame.shape[0], y+h+pad)
-        x1, x2 = max(0, x-pad), min(frame.shape[1], x+w+pad)
-        bar_img = frame[y1:y2, x1:x2]
-        
-        if bar_img.size == 0:
-            return 1.0
-
-        hsv = cv2.cvtColor(bar_img, cv2.COLOR_BGR2HSV)
-        mask = self._get_mask(hsv, bar_type)
-        
-        # Save mask globally for visualization overlay
-        full_screen_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-        full_screen_mask[y1:y2, x1:x2] = mask
+    def _is_fill_pixel(self, bar_type, b, g, r):
+        """是否该条的填充色 (彩色填充)。"""
         if bar_type == 'HP':
-            self.last_hp_mask = full_screen_mask
+            return r > 120 and g < 100 and b < 100          # 红
+        if bar_type == 'MP':
+            return b > 120 and r < 100 and g < 180          # 蓝
+        if bar_type == 'EXP':
+            return r > 120 and g > 100 and b < 120          # 黄
+        return False
+
+    def _is_gray_bar(self, b, g, r):
+        """是否条的空余部分 (浅灰, R≈G≈B 且较亮, 参考项目 tolerance 逻辑)。"""
+        return abs(r - g) <= 15 and abs(r - b) <= 15 and r >= 120
+
+    def _find_fill_bbox(self, hsv, bar_type, roi_top):
+        """找某条的最大彩色填充矩形。"""
+        mask = self._get_color_mask(hsv, bar_type)
+        mask[:roi_top, :] = 0
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid = []
+        for c in contours:
+            x, y, cw, ch = cv2.boundingRect(c)
+            if cw > 30 and ch > 2 and cw / ch > 2.0:
+                valid.append((x, y, cw, ch))
+        if not valid:
+            return None
+        return max(valid, key=lambda b: b[2] * b[3])
+
+    def _expand_to_full_bar(self, frame, bar_type, fill_bbox):
+        """从填充 bbox 出发, 沿中心行向两侧扩展, 得到条的全宽 (填充色 + 浅灰空余)。"""
+        x, y, w, h = fill_bbox
+        fh, fw = frame.shape[:2]
+        cy = min(fh - 1, y + h // 2)
+        cx = min(fw - 1, x + w // 2)
+
+        def is_bar(px):
+            b, g, r = px.astype(int)
+            return self._is_fill_pixel(bar_type, b, g, r) or self._is_gray_bar(b, g, r)
+
+        left = cx
+        while left > 0 and is_bar(frame[cy, left]):
+            left -= 1
+        right = cx
+        while right < fw - 1 and is_bar(frame[cy, right]):
+            right += 1
+        return (left + 1, y, max(1, right - left - 1), h)
+
+    def calibrate(self, frame: np.ndarray) -> bool:
+        """找 HP/MP 条并扩展到全宽。只要求这两条 (喝药只依赖它们)。"""
+        h_img = frame.shape[0]
+        roi_top = int(h_img * 0.88)  # 条在底部 UI
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        hp_fill = self._find_fill_bbox(hsv, 'HP', roi_top)
+        mp_fill = self._find_fill_bbox(hsv, 'MP', roi_top)
+        exp_fill = self._find_fill_bbox(hsv, 'EXP', roi_top)
+
+        layout_ok = (
+            hp_fill and mp_fill
+            and hp_fill[0] < mp_fill[0]                    # HP 在 MP 左
+            and abs(hp_fill[1] - mp_fill[1]) < 20          # 同一行
+        )
+
+        if layout_ok:
+            self.hp_bbox = self._expand_to_full_bar(frame, 'HP', hp_fill)
+            self.mp_bbox = self._expand_to_full_bar(frame, 'MP', mp_fill)
+            self.exp_bbox = self._expand_to_full_bar(frame, 'EXP', exp_fill) if exp_fill else (0, 0, 0, 0)
+            self.is_calibrated = True
+            log.info(f"HP/MP 校准成功: HP全宽={self.hp_bbox} MP全宽={self.mp_bbox}")
         else:
-            self.last_mp_mask = full_screen_mask
-        
-        _, _, current_w, _ = cv2.boundingRect(mask)
-        
-        if max_w > 0:
-            return float(current_w) / float(max_w)
-            
-        if max_p > 0:
-            return float(cv2.countNonZero(mask)) / float(max_p)
-            
-        return 1.0
+            self.is_calibrated = False
+            log.warning(f"HP/MP 校准失败 (需底部UI两条条可见且 HP在MP左): HP={hp_fill} MP={mp_fill}")
+        return self.is_calibrated
+
+    def _read_bar(self, frame: np.ndarray, bbox: tuple, bar_type: str) -> float:
+        """中心行读数: 填充比 = 彩色 / (彩色 + 浅灰空余), 参考项目 get_bar_percent。"""
+        x, y, w, h = bbox
+        fh, fw = frame.shape[:2]
+        if w <= 2 or h <= 2 or y >= fh or x >= fw:
+            return 1.0
+        cy = min(fh - 1, y + h // 2)
+        x1 = min(fw, x + w)
+        line = frame[cy, x:x1]
+
+        filled = 0
+        total = 0
+        for (b, g, r) in line:
+            b, g, r = int(b), int(g), int(r)
+            if self._is_fill_pixel(bar_type, b, g, r):
+                filled += 1
+                total += 1
+            elif self._is_gray_bar(b, g, r):
+                total += 1
+        return (filled / total) if total > 0 else 1.0
 
     def read(self, frame: np.ndarray) -> VitalStats:
-        """
-        Extremely fast and precise percentage extraction on CPU.
-        """
+        """读取 HP/MP 百分比。未校准或校准失败 → 返回全满 (不误喝药)。"""
         if not self.is_calibrated:
             self.calibrate(frame)
-            
-        hp_pct = self._read_bar_percentage(frame, self.hp_bbox, 'HP', self.hp_max_width, self.hp_max_pixels)
-        mp_pct = self._read_bar_percentage(frame, self.mp_bbox, 'MP', self.mp_max_width, self.mp_max_pixels)
+            if not self.is_calibrated:
+                return VitalStats(hp_percent=1.0, mp_percent=1.0,
+                                  hp_critical=False, mp_critical=False)
+
+        hp_pct = self._read_bar(frame, self.hp_bbox, 'HP')
+        mp_pct = self._read_bar(frame, self.mp_bbox, 'MP')
 
         hp_pct = max(0.0, min(1.0, hp_pct))
         mp_pct = max(0.0, min(1.0, mp_pct))
@@ -197,4 +184,3 @@ class HPMonitor:
             hp_critical=(hp_pct < self.hp_threshold),
             mp_critical=(mp_pct < self.mp_threshold)
         )
-

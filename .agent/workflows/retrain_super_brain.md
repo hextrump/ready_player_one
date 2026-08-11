@@ -1,28 +1,22 @@
 ---
-description: Automatically retrain the Super Brain model with current data
+description: Retrain the V19 single-class Monster model with current data
 ---
 
-This workflow automates the process of unifying datasets and launching the training for the Super Brain (YOLOv8).
+该工作流自动化"整理怪数据集 → 训练 V19 单类怪模型 → 部署"的流程。
 
-1. Ensure snapshot labels are up to date.
-2. Run dataset unification:
+1. 收集快照: 运行 bot 时 `data_collector` 自动心跳截图到 `data/auto_dataset/`;
+   也可主动采集误检样本。
+2. 整理数据集: 把快照整理/标注为 `data/yolo_monster_dataset/dataset.yaml` (单类 Monster)。
+3. 启动训练:
 // turbo
-`python scripts/unify_dataset.py`
+`python archive/train_monster_v19.py`
 
-3. Generate synthetic background data (Optional but recommended):
+4. 训练完成后, 找到 `runs/detect/monster_v19_pig/weights/best.pt`。
+
+5. 复制到 models:
 // turbo
-`python generate_yolo_data.py`
+`cp runs/detect/monster_v19_pig/weights/best.pt models/monster_v19.pt`
 
-4. Launch training:
+6. 提交并推送:
 // turbo
-`python train_super_brain.py`
-
-5. After training completes, look for the `best.pt` in `runs/detect/super_brain_v11_highres/weights/`.
-
-6. Copy to models:
-// turbo
-`cp runs/detect/super_brain_v11_highres/weights/best.pt models/super_brain_v11.pt`
-
-7. Commit and Push:
-// turbo
-`git add models/super_brain_v11.pt; git commit -m "update: super brain model weights"; git push origin main`
+`git add models/monster_v19.pt; git commit -m "update: monster v19 weights"; git push origin main`

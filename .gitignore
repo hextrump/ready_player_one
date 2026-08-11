@@ -33,3 +33,10 @@ models/
 
 # --- User Config ---
 config.yaml
+
+# --- Syncthing 内部目录 (非模型, 不同步) ---
+models/.stfolder/
+
+# --- 名牌模板备份 (非必需, 不同步) ---
+models/nametag/*_backup.*
+models/nametag/*_old.*
