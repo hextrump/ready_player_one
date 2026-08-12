@@ -83,85 +83,108 @@ class HPMonitor:
         """是否条的空余部分 (浅灰, R≈G≈B 且较亮, 参考项目 tolerance 逻辑)。"""
         return abs(r - g) <= 15 and abs(r - b) <= 15 and r >= 120
 
-    def _find_fill_bbox(self, hsv, bar_type, roi_top):
-        """找某条的最大彩色填充矩形。"""
+    def _find_fill_bbox(self, hsv, bar_type, roi_top, right_limit=None, min_aspect=1.0):
+        """找某条的最大彩色填充矩形。
+        right_limit: 只搜该 x 左侧 (HP 固定在 MP 左侧, 过滤右侧技能图标)。
+        min_aspect: 最低宽高比 (MP 满条用 2.5 过滤方形图标; HP 低血量细条用 1.0 不放宽)。"""
         mask = self._get_color_mask(hsv, bar_type)
         mask[:roi_top, :] = 0
+        if right_limit is not None:
+            mask[:, right_limit:] = 0
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         valid = []
         for c in contours:
             x, y, cw, ch = cv2.boundingRect(c)
-            if cw > 30 and ch > 2 and cw / ch > 2.0:
+            if cw > 8 and ch >= 3 and cw / ch >= min_aspect:
                 valid.append((x, y, cw, ch))
         if not valid:
             return None
         return max(valid, key=lambda b: b[2] * b[3])
 
     def _expand_to_full_bar(self, frame, bar_type, fill_bbox):
-        """从填充 bbox 出发, 沿中心行向两侧扩展, 得到条的全宽 (填充色 + 浅灰空余)。"""
+        """沿填充纵向范围逐行向两侧扩展, 取最宽的一行作为条的全宽 (填充色 + 浅灰空余)。
+        最宽不足 10px → 非条 (图标/误检), 返回 None。"""
         x, y, w, h = fill_bbox
         fh, fw = frame.shape[:2]
-        cy = min(fh - 1, y + h // 2)
-        cx = min(fw - 1, x + w // 2)
+        best_w = 0
+        best_left = 0
+        for ry in range(max(0, y), min(fh - 1, y + h)):
+            row = frame[ry]
 
-        def is_bar(px):
-            b, g, r = px.astype(int)
-            return self._is_fill_pixel(bar_type, b, g, r) or self._is_gray_bar(b, g, r)
+            def is_bar(px):
+                b, g, r = px.astype(int)
+                return self._is_fill_pixel(bar_type, b, g, r) or self._is_gray_bar(b, g, r)
 
-        left = cx
-        while left > 0 and is_bar(frame[cy, left]):
-            left -= 1
-        right = cx
-        while right < fw - 1 and is_bar(frame[cy, right]):
-            right += 1
-        return (left + 1, y, max(1, right - left - 1), h)
+            # 在该行内找包含填充的最宽"条像素"段
+            cx = min(fw - 1, x + w // 2)
+            if not is_bar(row[cx]):
+                continue
+            left = cx
+            while left > 0 and is_bar(row[left]):
+                left -= 1
+            right = cx
+            while right < fw - 1 and is_bar(row[right]):
+                right += 1
+            ww = right - left - 1
+            if ww > best_w:
+                best_w = ww
+                best_left = left + 1
+        if best_w < 10:
+            return None
+        return (best_left, y, best_w, h)
 
     def calibrate(self, frame: np.ndarray) -> bool:
-        """找 HP/MP 条并扩展到全宽。只要求这两条 (喝药只依赖它们)。"""
+        """找 HP/MP 条并扩展到全宽。以 MP 蓝条为锚, HP 红条只在 MP 左侧同行找。
+        放宽到低血量小填充 (细条也能命中); 扩展后过窄 → 视为非条, 失败待下帧重试。"""
         h_img = frame.shape[0]
-        roi_top = int(h_img * 0.88)  # 条在底部 UI
+        roi_top = int(h_img * 0.85)  # 条在底部 UI
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        hp_fill = self._find_fill_bbox(hsv, 'HP', roi_top)
-        mp_fill = self._find_fill_bbox(hsv, 'MP', roi_top)
-        exp_fill = self._find_fill_bbox(hsv, 'EXP', roi_top)
+        # MP 先找 (满条宽扁, 用高宽高比过滤方形技能图标)
+        mp_fill = self._find_fill_bbox(hsv, 'MP', roi_top, min_aspect=2.5)
+        # HP 固定在 MP 左侧同行, 不限宽高比 (低血量时是细条)
+        hp_fill = self._find_fill_bbox(hsv, 'HP', roi_top, right_limit=mp_fill[0]) if mp_fill else None
 
         layout_ok = (
-            hp_fill and mp_fill
+            mp_fill is not None and hp_fill is not None
             and hp_fill[0] < mp_fill[0]                    # HP 在 MP 左
-            and abs(hp_fill[1] - mp_fill[1]) < 20          # 同一行
+            and abs(hp_fill[1] - mp_fill[1]) < 25          # 同一行
         )
 
         if layout_ok:
             self.hp_bbox = self._expand_to_full_bar(frame, 'HP', hp_fill)
             self.mp_bbox = self._expand_to_full_bar(frame, 'MP', mp_fill)
-            self.exp_bbox = self._expand_to_full_bar(frame, 'EXP', exp_fill) if exp_fill else (0, 0, 0, 0)
-            self.is_calibrated = True
-            log.info(f"HP/MP 校准成功: HP全宽={self.hp_bbox} MP全宽={self.mp_bbox}")
+            self.exp_bbox = (0, 0, 0, 0)
+            if self.hp_bbox is None or self.mp_bbox is None:
+                self.is_calibrated = False
+                log.warning(f"HP/MP 校准失败 (条扩展异常): HP={self.hp_bbox} MP={self.mp_bbox}")
+            else:
+                self.is_calibrated = True
+                log.info(f"HP/MP 校准成功: HP全宽={self.hp_bbox} MP全宽={self.mp_bbox}")
         else:
             self.is_calibrated = False
             log.warning(f"HP/MP 校准失败 (需底部UI两条条可见且 HP在MP左): HP={hp_fill} MP={mp_fill}")
         return self.is_calibrated
 
     def _read_bar(self, frame: np.ndarray, bbox: tuple, bar_type: str) -> float:
-        """中心行读数: 填充比 = 彩色 / (彩色 + 浅灰空余), 参考项目 get_bar_percent。"""
+        """整条区域读数: 填充比 = 彩色 / (彩色 + 浅灰空余), 对中心行被遮挡/空心更鲁棒。"""
         x, y, w, h = bbox
         fh, fw = frame.shape[:2]
-        if w <= 2 or h <= 2 or y >= fh or x >= fw:
+        if w <= 2 or y >= fh or x >= fw:
             return 1.0
-        cy = min(fh - 1, y + h // 2)
+        y1 = min(fh - 1, y + max(1, h))
         x1 = min(fw, x + w)
-        line = frame[cy, x:x1]
 
         filled = 0
         total = 0
-        for (b, g, r) in line:
-            b, g, r = int(b), int(g), int(r)
-            if self._is_fill_pixel(bar_type, b, g, r):
-                filled += 1
-                total += 1
-            elif self._is_gray_bar(b, g, r):
-                total += 1
+        for yy in range(y, y1):
+            for (b, g, r) in frame[yy, x:x1]:
+                b, g, r = int(b), int(g), int(r)
+                if self._is_fill_pixel(bar_type, b, g, r):
+                    filled += 1
+                    total += 1
+                elif self._is_gray_bar(b, g, r):
+                    total += 1
         return (filled / total) if total > 0 else 1.0
 
     def read(self, frame: np.ndarray) -> VitalStats:

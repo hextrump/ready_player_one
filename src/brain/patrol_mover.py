@@ -25,11 +25,12 @@ log = get_logger("patrol_mover")
 APPROACH_MAX_SEC = 3.0   # 单次水平走最长秒数 (超时交给外层重决策)
 APPROACH_POLL = 0.04     # 行走循环轮询间隔
 MOVE_PX_EPS = 3          # 判定"在移动"的像素阈值 (感知 ~5.5fps)
-STUCK_JUMP_TIMEOUT = 0.6 # 移动无进度多久判定卡住, 触发反向脱困跳
+STUCK_JUMP_TIMEOUT = 1.0 # 移动无进度多久判定卡住, 触发反向脱困跳 (感知~5.5fps, 需容忍几帧)
 
 WALK_EDGE_MARGIN = 25    # 巡逻到平台边缘多少 px 内处理 (爬梯/换向)
 PATROL_DURATION = 3.0    # 无怪时定时换向间隔
 PATROL_STEP = 0.5        # 巡逻单步行走时长
+PATROL_ATTACK_RANGE = 220  # 巡逻时距怪多少 px 内才普攻 (防空挥)
 
 SURFACE_TOL_Y = 30       # 点是否落在平台上的 y 容差 (实测怪框/玩家脚底与平台 y 偏移 23-25px)
 PLAYER_FOOT_OFFSET = 35  # 玩家中心 → 脚底
@@ -102,8 +103,10 @@ class PatrolMover:
         self._walk_toward(controller, target.cx, px, brain)
 
     def _walk_toward(self, controller: GameController, goal_x: int, px: int, brain) -> None:
-        """水平走向 goal_x: 进范围/到达/超时 即停; 无进度则反向脱困跳一下。"""
+        """水平走向 goal_x: 进范围/到达/超时 即停。
+        仅在玩家位置可信时做脱困跳 (中心猜测时位置冻结, 会误判卡住狂跳)。"""
         direction = Direction.RIGHT if goal_x >= px else Direction.LEFT
+        reliable = brain.player_reliable()
         start = time.time()
         last_px = px
         last_move = time.time()
@@ -116,6 +119,10 @@ class PatrolMover:
                 if (direction == Direction.RIGHT and cur_px >= goal_x - MOVE_PX_EPS) or \
                    (direction == Direction.LEFT and cur_px <= goal_x + MOVE_PX_EPS):
                     break
+                # 玩家位置不可信 → 只盲走到超时/进范围, 不做卡顿跳 (位置冻结会假触发)
+                if not reliable:
+                    time.sleep(APPROACH_POLL)
+                    continue
                 if abs(cur_px - last_px) >= MOVE_PX_EPS:
                     last_px = cur_px
                     last_move = time.time()
@@ -153,7 +160,10 @@ class PatrolMover:
                 return
 
         controller.move_direction(self.patrol_direction, duration=PATROL_STEP)
-        controller.attack_single()
+
+        # 附近有怪才普攻 (否则纯走路, 防空挥)
+        if brain.any_target_near(PATROL_ATTACK_RANGE):
+            controller.attack_single()
 
     def _at_edge(self, controller: GameController, px: int, py: int, ropes: list,
                  sup: tuple, is_right: bool, brain) -> None:

@@ -143,6 +143,7 @@ class CombatBrain:
             "fps": 0.0
         }
         self._v13_fallback_first_log = True  # v13 Player 兜底首次接管时打一次日志
+        self._player_reliable = False  # 本帧玩家位置是否来自可信来源 (名牌/v13), 决定脱困跳是否可信
         self._running = False
         self.state = BrainState.STANDBY
         self.kill_count = 0
@@ -171,33 +172,39 @@ class CombatBrain:
 
         while self._running:
             t0 = time.time()
-            frame = capture.grab()
-            if frame is None or frame.size == 0:
-                time.sleep(0.1)
-                continue
+            try:
+                frame = capture.grab()
+                if frame is None or frame.size == 0:
+                    time.sleep(0.1)
+                    continue
 
-            # 运行核心检测 (双模型: v19 怪 + v13 地形/玩家)
-            targets, px, py, raw_results, platforms, ropes = self.find_targets(frame)
+                # 运行核心检测 (双模型: v19 怪 + v13 地形/玩家)
+                targets, px, py, raw_results, platforms, ropes = self.find_targets(frame)
 
-            # 更新共享缓存
-            with self._vision_lock:
-                self._latest_frame = frame.copy()
-                self._latest_perception = {
-                    "targets": targets,
-                    "player_x": px,
-                    "player_y": py,
-                    "platforms": platforms,
-                    "ropes": ropes,
-                    "fps": 1.0 / (time.time() - t0 + 0.001)
-                }
+                # 更新共享缓存
+                with self._vision_lock:
+                    self._latest_frame = frame.copy()
+                    self._latest_perception = {
+                        "targets": targets,
+                        "player_x": px,
+                        "player_y": py,
+                        "platforms": platforms,
+                        "ropes": ropes,
+                        "fps": 1.0 / (time.time() - t0 + 0.001)
+                    }
 
-            # 定时心跳截图 (仅常规样本, 每 save_interval_seconds 秒一帧)
-            if raw_results is not None:
-                self.data_collector.maybe_save_heartbeat(frame, raw_results)
+                # 定时心跳截图 (仅常规样本, 每 save_interval_seconds 秒一帧)
+                # 只挂机中采集; 按 F 停止 (active_hunting=False) 后不再自动截图
+                if self.active_hunting and raw_results is not None:
+                    self.data_collector.maybe_save_heartbeat(frame, raw_results)
 
-            # 控制频率: 去掉 5fps 硬上限, 按单帧实际工作量跑 (~7fps) → 感知更新更快, 攻击反应更快
-            elapsed = time.time() - t0
-            time.sleep(max(0.005, 0.05 - elapsed))
+                # 控制频率: 去掉 5fps 硬上限, 按单帧实际工作量跑 (~7fps) → 感知更新更快, 攻击反应更快
+                elapsed = time.time() - t0
+                time.sleep(max(0.005, 0.05 - elapsed))
+            except Exception as e:
+                # 单帧异常不杀死视觉线程 (否则 bot 变瞎); 记日志并短暂降频重试
+                log.error(f"[VISION] 感知线程单帧异常: {e}", exc_info=True)
+                time.sleep(0.5)
 
     def find_targets(self, frame) -> tuple[List[Target], int, int, Optional[object], list, list]:
         """双模型感知: 玩家位置名牌锚定(v13 Player 兜底), 怪由 v19 检测,
@@ -268,8 +275,8 @@ class CombatBrain:
             ropes = dedup
 
         # ── 玩家位置: 名牌 miss → v13 Player 兜底 → 画面中心衰减 ──
+        used_v13 = False
         if not matched and not pending:
-            used_v13 = False
             if player_cand is not None:
                 dist_c = math.hypot(player_cand[0] - player_x, player_cand[1] - player_y)
                 if dist_c <= PLAYER_MAX_MOVE_PX:
@@ -298,6 +305,9 @@ class CombatBrain:
                             int(round(player_y + dy * step))
                         )
                     player_x, player_y = self._cached_player_pos
+
+        # 玩家位置可信度: 名牌命中 或 v13 兜底 → 可信; 中心猜测/衰减 → 不可信 (移动层据此关掉假脱困跳)
+        self._player_reliable = matched or used_v13
 
         # 玩家排除区域 (名牌锚定): v19 常把玩家自己误检成 Monster, 用重叠面积过滤
         player_excl = (player_x - 45, player_y - 60, player_x + 45, player_y + 60)
@@ -401,6 +411,23 @@ class CombatBrain:
         if not tgs:
             return None
         return min(tgs, key=lambda t: math.hypot(t.cx - px, t.cy - py))
+
+    def any_target_near(self, dist: float = 220.0) -> bool:
+        """附近 dist 像素内是否有怪 (巡逻时判断要不要普攻, 避免空挥)。"""
+        with self._vision_lock:
+            perc = self._latest_perception
+            tgs = perc["targets"]
+            px = perc["player_x"]
+            py = perc["player_y"]
+        for t in tgs:
+            if math.hypot(t.cx - px, t.cy - py) <= dist:
+                return True
+        return False
+
+    def player_reliable(self) -> bool:
+        """本帧玩家位置是否可信 (名牌/v13 命中)。不可信时移动层应关闭脱困跳, 避免假卡顿乱跳。"""
+        with self._vision_lock:
+            return self._player_reliable
 
     def _attack(self, controller: GameController, target: Target, px: int, py: int) -> int:
         """发动攻击: 区分地面 burst 连打和空中跳发补刀。"""

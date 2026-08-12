@@ -236,10 +236,16 @@ class WindowCapture:
 
             client_frame = client_frame.copy()
 
-            # 8. PrintWindow 对某些 DX 游戏会整屏返回黑, 或返回"内容+右侧黑边"的残缺帧
+            # 8. 空帧防护: 窗口最小化/尺寸异常时 PrintWindow 返回 0x0 或残缺帧,
+            #    后续 letterbox 除零会崩溃 → 直接返回 None (调用方会重试)
+            if client_frame.size == 0 or client_frame.shape[0] < 2 or client_frame.shape[1] < 2:
+                self._last_grab_was_fallback = False
+                return None
+
+            # 9. PrintWindow 对某些 DX 游戏会整屏返回黑, 或返回"内容+右侧黑边"的残缺帧
             #    → 检测大面积近黑像素 (>25%) 就回退 BitBlt 屏幕截图 (需窗口可见/在前台)
             black_ratio = float((client_frame.mean(axis=2) < 10).mean())
-            if black_ratio > 0.25:
+            if not np.isfinite(black_ratio) or black_ratio > 0.25:
                 try:
                     client_frame = self._grab_bitblt()
                     if not getattr(self, '_last_grab_was_fallback', False):
@@ -248,6 +254,10 @@ class WindowCapture:
                 except Exception as e:
                     log.warning(f"PrintWindow 黑屏且 BitBlt 兜底失败: {e}")
                     self._last_grab_was_fallback = False
+                # BitBlt 兜底也可能返回空 → 再次防护
+                if client_frame is None or client_frame.size == 0 or \
+                        client_frame.shape[0] < 2 or client_frame.shape[1] < 2:
+                    return None
             else:
                 self._last_grab_was_fallback = False
 
