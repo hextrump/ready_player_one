@@ -143,6 +143,7 @@ class CombatBrain:
             "fps": 0.0
         }
         self._v13_fallback_first_log = True  # v13 Player 兜底首次接管时打一次日志
+        self._prev_gray = None               # 帧间运动检测用上一帧灰度
         self._player_reliable = False  # 本帧玩家位置是否来自可信来源 (名牌/v13), 决定脱困跳是否可信
         self._running = False
         self.state = BrainState.STANDBY
@@ -181,6 +182,15 @@ class CombatBrain:
                 # 运行核心检测 (双模型: v19 怪 + v13 地形/玩家)
                 targets, px, py, raw_results, platforms, ropes = self.find_targets(frame)
 
+                # 帧间运动量 (卡住检测): 玩家走动/相机滚动时画面一直变; 卡住时画面静止
+                gray_small = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray_small = cv2.resize(gray_small, (160, 90))
+                if self._prev_gray is not None:
+                    motion = float(cv2.absdiff(gray_small, self._prev_gray).mean())
+                else:
+                    motion = 1.0
+                self._prev_gray = gray_small
+
                 # 更新共享缓存
                 with self._vision_lock:
                     self._latest_frame = frame.copy()
@@ -190,6 +200,7 @@ class CombatBrain:
                         "player_y": py,
                         "platforms": platforms,
                         "ropes": ropes,
+                        "motion": motion,
                         "fps": 1.0 / (time.time() - t0 + 0.001)
                     }
 
@@ -423,6 +434,12 @@ class CombatBrain:
             if math.hypot(t.cx - px, t.cy - py) <= dist:
                 return True
         return False
+
+    def world_moving(self, threshold: float = 1.5) -> bool:
+        """画面是否在变化 (玩家走动/相机滚动/怪移动)。卡在边缘时画面静止 → False。"""
+        with self._vision_lock:
+            m = self._latest_perception.get("motion", 1.0)
+        return m > threshold
 
     def player_reliable(self) -> bool:
         """本帧玩家位置是否可信 (名牌/v13 命中)。不可信时移动层应关闭脱困跳, 避免假卡顿乱跳。"""

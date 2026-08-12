@@ -31,6 +31,7 @@ WALK_EDGE_MARGIN = 25    # 巡逻到平台边缘多少 px 内处理 (爬梯/换�
 PATROL_DURATION = 3.0    # 无怪时定时换向间隔
 PATROL_STEP = 0.5        # 巡逻单步行走时长
 PATROL_ATTACK_RANGE = 220  # 巡逻时距怪多少 px 内才普攻 (防空挥)
+PATROL_STUCK_TIMEOUT = 0.8  # 画面静止多久判定卡住 (名牌失效也能用: 相机不动=玩家没动)
 
 SURFACE_TOL_Y = 30       # 点是否落在平台上的 y 容差 (实测怪框/玩家脚底与平台 y 偏移 23-25px)
 PLAYER_FOOT_OFFSET = 35  # 玩家中心 → 脚底
@@ -51,6 +52,7 @@ class PatrolMover:
     def __init__(self):
         self.patrol_direction = Direction.RIGHT
         self._patrol_start_time = time.time()
+        self._last_motion_t = time.time()   # 最近一次画面有动静的时间 (卡住检测)
 
     # ===== 可及性判断 =====
 
@@ -141,7 +143,19 @@ class PatrolMover:
 
     def patrol(self, controller: GameController, px: int, py: int,
                platforms: list, ropes: list, brain) -> None:
-        """地形巡逻: 沿平台走, 到边缘 爬梯/换向; 方向朝最近怪偏置。"""
+        """地形巡逻: 沿平台走, 到边缘 爬梯/换向; 方向朝最近怪偏置。
+        卡住检测: 名牌失效时玩家坐标不更新, 用"画面是否静止"判断玩家是否真的在动。"""
+        # 卡住检测: 一直在走但画面静止 (相机不动=玩家被卡住, 名牌失效也能用)
+        if brain.world_moving():
+            self._last_motion_t = time.time()
+        elif time.time() - self._last_motion_t > PATROL_STUCK_TIMEOUT:
+            log.info("!! 巡逻卡住(画面静止), 反向脱困跳 + 换向 !!")
+            back = Direction.LEFT if self.patrol_direction == Direction.RIGHT else Direction.RIGHT
+            controller.diagonal_jump(back)
+            self._flip()
+            self._last_motion_t = time.time()
+            return
+
         nt = brain.nearest_target()
         if nt is not None:
             # 朝最近怪方向走 (覆盖可及性不足时, 巡逻主动靠近)
