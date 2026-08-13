@@ -67,6 +67,7 @@ import win32gui
 from src.capture.window_capture import WindowCapture
 from src.brain.game_controller import GameController
 from src.utils.logger import get_logger
+from src.utils.config import load_config
 
 log = get_logger("measure_input_ratio")
 
@@ -510,8 +511,8 @@ def main():
     ap = argparse.ArgumentParser(description="输入到达率测量 (步骤0: 量化)")
     ap.add_argument("--mode", choices=["manual", "inject"], default="manual",
                     help="manual=你手动打; inject=脚本注入 bot 路径 (默认 manual)")
-    ap.add_argument("--process", default="msw.exe",
-                    help="游戏进程名 (默认 msw.exe; 找不到时试 Maplestory_Classic.exe)")
+    ap.add_argument("--process", default=None,
+                    help="游戏进程名 (默认读 config.yaml game.process_name)")
     ap.add_argument("--title", default=None, help="游戏窗口标题 (进程名找不到时的备选)")
     ap.add_argument("--region", default=None,
                     help="检测区域 'x,y,w,h' (默认拖框选择)")
@@ -519,6 +520,8 @@ def main():
     ap.add_argument("--no-preview", action="store_true",
                     help="不弹预览窗口, 直接测 (用默认中央区域或 --region)")
     args = ap.parse_args()
+    # 进程名缺省时从 config.yaml 读 (与 main.py 一致), 保持本机配置单一来源
+    args.process = args.process or load_config().get("game", {}).get("process_name", "msw.exe")
 
     m = Measure(args)
     return m.run()
