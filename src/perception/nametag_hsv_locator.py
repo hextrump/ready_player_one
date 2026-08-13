@@ -29,8 +29,14 @@ BADGE_UPPER = np.array([118, 255, 230])
 NAME_LOWER = np.array([0, 0, 200])
 NAME_UPPER = np.array([40, 100, 255])
 
-ASPECT_MIN, ASPECT_MAX = 3.0, 12.0
-HEIGHT_MIN, HEIGHT_MAX = 15, 60
+# 宠物黄框 mask (例 "花蘑菇仔" 黄色矩形) - 用于在白名 mask 里挖掉宠物区
+# 防止: 1) 宠物遮挡玩家名 → aspect ratio 异常; 2) 宠物被误识别成白名候选
+PET_LOWER = np.array([15, 100, 150])
+PET_UPPER = np.array([40, 255, 255])
+PET_DILATE_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))  # 把宠物整块挖掉
+
+ASPECT_MIN, ASPECT_MAX = 2.5, 12.0   # 原 3.0-12.0; 放宽到 2.5 容忍边缘截断
+HEIGHT_MIN, HEIGHT_MAX = 12, 60     # 原 15-60; 放宽到 12 容忍边缘截断
 Y_MIN_BOX, Y_MAX_BOX = 200, 720
 
 NAME_GAP_MIN, NAME_GAP_MAX = 5, 30
@@ -87,6 +93,11 @@ class NametagHSVLocator:
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         badge_mask = cv2.inRange(hsv, BADGE_LOWER, BADGE_UPPER)
         name_mask = cv2.inRange(hsv, NAME_LOWER, NAME_UPPER)
+
+        # 挖掉宠物黄框区: 宠物黄框和玩家白名可能在同一行, 直接 sub mask
+        pet_mask = cv2.inRange(hsv, PET_LOWER, PET_UPPER)
+        pet_mask = cv2.dilate(pet_mask, PET_DILATE_KERNEL, iterations=1)
+        name_mask = name_mask & ~pet_mask  # 去掉宠物所在区域, 避免误识别 + 容忍遮挡
 
         badges = _find_candidates(badge_mask)
         names = _find_candidates(name_mask)

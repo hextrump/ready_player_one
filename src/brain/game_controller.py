@@ -89,9 +89,9 @@ class GameController:
 
     用法:
         ctrl = GameController(hwnd=wc.hwnd)
-        ctrl.move_right(0.5)        # 向右走
-        ctrl.attack_single()         # 普攻
-        ctrl.jump()                  # 跳
+        ctrl.move_direction(Direction.RIGHT, 0.5)  # 向右走
+        ctrl.attack_single()                        # 普攻
+        ctrl.jump()                                 # 跳
     """
 
     def __init__(
@@ -209,34 +209,28 @@ class GameController:
         self.key_up(key_name)
         self._post_action()
 
-    def tap_key(self, key_name: str, post_action: bool = True) -> None:
+    def tap_key(self, key_name: str, post_action: bool = True,
+                hold: float | None = None) -> None:
         """
         快速点按。
         post_action=True  (默认): 加 jitter + _post_action,用于普通单次点击
         post_action=False: 纯净快速连点,用于 burst 连按场景
+        hold: 强制按键保持时长 (秒)。burst 模式下默认 20~45ms 随机,模拟人手按键深浅。
         """
         self.key_down(key_name)
         if post_action:
             time.sleep(0.02 + self._jitter())
         else:
-            time.sleep(0.01)  # burst 时只保留 10ms 最小按键保持时间 (提速)
+            # burst 拟人: 按下时长随机,既不像"一碰就松"也不像"死死按住"
+            if hold is None:
+                time.sleep(random.uniform(0.020, 0.045))
+            else:
+                time.sleep(hold)
         self.key_up(key_name)
         if post_action:
             self._post_action()
 
     # ── 移动 ──
-
-    def move_left(self, duration: float = 0.3) -> None:
-        self.press_key("left", duration)
-
-    def move_right(self, duration: float = 0.3) -> None:
-        self.press_key("right", duration)
-
-    def move_up(self, duration: float = 0.2) -> None:
-        self.press_key("up", duration)
-
-    def move_down(self, duration: float = 0.2) -> None:
-        self.press_key("down", duration)
 
     def move_direction(self, direction: Direction, duration: float = 0.3) -> None:
         self.press_key(direction.value, duration)
@@ -288,32 +282,6 @@ class GameController:
     def attack_single(self) -> None:
         self.tap_key("x")
 
-    def attack_aoe(self) -> None:
-        self.tap_key("c")
-
-    def pickup(self) -> None:
-        """捡取掉落物 (Z 键)。"""
-        self.tap_key("z")
-
-    def quick_pickup(self) -> None:
-        """战斗中持续按节奏捡取用的单次 Z (无延迟,burst loop 内调用避免卡攻击)。"""
-        self.tap_key("z", post_action=False)
-
-    def spam_pickup(self) -> None:
-        """巡逻/无怪时随机 spam Z 捡取 (1 秒内按 2-3 次)。"""
-        count = random.randint(2, 3)
-        for _ in range(count):
-            self.tap_key("z")
-            time.sleep(0.1)
-
-    def attack_and_move(self, direction: Direction) -> None:
-        self.key_down(direction.value)
-        time.sleep(0.05)
-        self.tap_key("x")
-        time.sleep(0.1 + self._jitter())
-        self.key_up(direction.value)
-        self._post_action()
-
     def jump_attack(self, direction: Direction) -> None:
         """跳发攻击:Alt + X 同时按,用于打击高处怪物。"""
         self.key_down(direction.value)
@@ -326,34 +294,6 @@ class GameController:
         time.sleep(0.1)
         self.key_up(direction.value)
         self._post_action()
-
-    # ── 组合 ──
-
-    def hunt_combo(self, direction: Direction) -> None:
-        self.key_down(direction.value)
-        time.sleep(0.03)
-        self.tap_key("alt")
-        time.sleep(0.08)
-        self.tap_key("x")
-        time.sleep(0.15)
-        self.key_up(direction.value)
-        time.sleep(0.1)
-        self.tap_key("z")
-        self._post_action()
-
-    def loot_sweep(self, width: float = 0.5) -> None:
-        self.move_left(width / 2)
-        time.sleep(0.05)
-        self.move_right(width)
-        time.sleep(0.05)
-        self.move_left(width / 2)
-
-    def idle_move(self) -> None:
-        d = random.choice(["left", "right"])
-        self.press_key(d, random.uniform(0.05, 0.15))
-
-    def enter_portal(self) -> None:
-        self.press_key("up", 0.5)
 
     # ── 内部 ──
 

@@ -17,6 +17,7 @@ V8.0 Combat Brain — v19 认怪 + v13 认地形/玩家 + PatrolMover 三层移�
 import time
 import threading
 import math
+import random
 import cv2
 import numpy as np
 from enum import Enum
@@ -54,10 +55,18 @@ ATTACK_RANGE_X = 120  # 水平攻击距离
 ATTACK_RANGE_Y = 30   # 垂直容差
 JUMP_ATTACK_RANGE_Y_UP = 120 # 跳发最高打击距离
 
-# Burst 连打参数 (提速攻击循环)
-BURST_INTERVAL = 0.03   # 每次攻击间隔 30ms (~33 下/秒)
-BURST_RECHECK = 0.15    # 每 150ms 检查目标是否还活着
-BURST_TIMEOUT = 3.0     # 单轮 burst 硬上限 3 秒 (防卡死)
+# Burst 连打参数 (拟人化 + 贴合冒险岛真实战斗节奏)
+# 冒险岛按一下技能键, 攻击动画 ~0.5~1.5s, 实际命中 1~2 下/秒。
+# burst 不应比游戏动画更快 — 更快也无伤害, 还会被 GameGuard 抓节奏特征。
+BURST_INTERVAL = 0.65       # 基线 ~1.5 下/秒 (贴近真实战斗节奏)
+BURST_JITTER   = 0.20       # 高斯抖动 ±200ms (0.45~0.85s 随机间隔)
+BURST_HOLD_MIN = 0.025      # 按键最小保持 25ms
+BURST_HOLD_MAX = 0.055      # 按键最大保持 55ms (按稍久更像人)
+BURST_PAUSE_EVERY = 5       # 每 ~5 下插入一次"换气停顿"
+BURST_PAUSE_MIN  = 0.7      # 停顿最短 0.7s (像技能动画未结束)
+BURST_PAUSE_MAX  = 1.5      # 停顿最长 1.5s (像走神/换技能)
+BURST_RECHECK = 0.40        # 每 400ms 检查目标是否还活着
+BURST_TIMEOUT = 8.0         # 单轮 burst 硬上限 8s (慢节奏下要留够击杀时间)
 
 # 平面地图模式: True = 关闭跳发攻击, 直线平推 (移动层跳跃/爬梯在 PatrolMover 独立控制)
 # 非平地(如射手村打猪猪)必须 False → 保留跳跃启发式
@@ -467,10 +476,12 @@ class CombatBrain:
             hit_count = 0
 
             try:
+                # 拟人化: 每次循环重算下一次间隔 (高斯抖动 + 偶发停顿)
+                next_interval = max(0.06, random.gauss(BURST_INTERVAL, BURST_JITTER))
                 while time.time() - start_t < BURST_TIMEOUT:
                     now = time.time()
 
-                    # 每 150ms 重新从视觉线程拉最新目标,死了就走
+                    # 每 BURST_RECHECK 重新从视觉线程拉最新目标,死了就走
                     if now - last_check_t >= BURST_RECHECK:
                         last_check_t = now
                         with self._vision_lock:
@@ -489,11 +500,20 @@ class CombatBrain:
                             log.info(f"[ATTACK] 目标消失/移出范围,提前结束 (共 {hit_count} 下)")
                             break
 
-                    # 每 60ms 按一次 (纯净 burst, 跳过 post_action)
-                    if now - last_attack_t >= BURST_INTERVAL:
-                        controller.tap_key("x", post_action=False)
+                    # 按键节奏: 间隔随机化 + 按下保持时长随机化
+                    if now - last_attack_t >= next_interval:
+                        hold = random.uniform(BURST_HOLD_MIN, BURST_HOLD_MAX)
+                        controller.tap_key("x", post_action=False, hold=hold)
                         hit_count += 1
                         last_attack_t = now
+                        # 重算下次间隔
+                        next_interval = max(0.06, random.gauss(BURST_INTERVAL, BURST_JITTER))
+                        # 周期性"思考停顿" (拟人节奏断点)
+                        if hit_count % BURST_PAUSE_EVERY == 0:
+                            time.sleep(random.uniform(BURST_PAUSE_MIN, BURST_PAUSE_MAX))
+                            # 停顿后再来一击, 间隔稍长 (像换气)
+                            next_interval = random.uniform(BURST_INTERVAL * 1.4,
+                                                           BURST_INTERVAL * 2.2)
 
                     time.sleep(0.005)
             finally:

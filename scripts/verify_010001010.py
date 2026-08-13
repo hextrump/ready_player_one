@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # 模型可能在 OmniParser 输出目录, 先找
 CANDIDATES = [
     PROJECT_ROOT / "runs" / "detect" / "super_brain_010001010" / "weights" / "best.pt",
-    Path("C:/Users/heyas/Documents/code/OmniParser/runs/detect/runs/detect/super_brain_010001010-3/weights/best.pt"),
+    Path("C:/Users/heyas/Documents/code/OmniParser/runs/detect/runs/detect/super_brain_010001010-6/weights/best.pt"),
 ]
 
 CLASS_NAMES = {
