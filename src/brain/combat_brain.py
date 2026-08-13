@@ -444,8 +444,9 @@ class CombatBrain:
                 return True
         return False
 
-    def world_moving(self, threshold: float = 1.5) -> bool:
-        """画面是否在变化 (玩家走动/相机滚动/怪移动)。卡在边缘时画面静止 → False。"""
+    def world_moving(self, threshold: float = 3.0) -> bool:
+        """画面是否在变化 (玩家走动/相机滚动/怪移动)。卡在边缘时画面静止 → False。
+        threshold 对应 src/brain/patrol_mover.MOTION_MOVING_THRESHOLD, 调低=更易判卡住。"""
         with self._vision_lock:
             m = self._latest_perception.get("motion", 1.0)
         return m > threshold

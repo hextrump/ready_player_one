@@ -14,6 +14,7 @@ PatrolMover — 地形感知移动 (从零重写, 极简版)
   - brain.player_pos()           -> (x, y) 当前玩家位置
   - brain.nearest_target()       -> Target|None 最近怪 (巡逻方向偏置)
 """
+import math
 import time
 
 from src.brain.game_controller import GameController, Direction
@@ -31,7 +32,9 @@ WALK_EDGE_MARGIN = 25    # 巡逻到平台边缘多少 px 内处理 (爬梯/换�
 PATROL_DURATION = 3.0    # 无怪时定时换向间隔
 PATROL_STEP = 0.5        # 巡逻单步行走时长
 PATROL_ATTACK_RANGE = 220  # 巡逻时距怪多少 px 内才普攻 (防空挥)
-PATROL_STUCK_TIMEOUT = 0.8  # 画面静止多久判定卡住 (名牌失效也能用: 相机不动=玩家没动)
+PATROL_CHASE_RANGE = 450   # 巡逻方向只朝该距离内的怪偏置 (防止被远处/异层怪锁方向)
+PATROL_STUCK_TIMEOUT = 1.0  # 画面静止多久判定卡住 (名牌失效也能用: 相机不动=玩家没动)
+MOTION_MOVING_THRESHOLD = 3.0  # 帧间运动量高于此才算"画面在动" (调低=更容易判定卡住)
 
 SURFACE_TOL_Y = 30       # 点是否落在平台上的 y 容差 (实测怪框/玩家脚底与平台 y 偏移 23-25px)
 PLAYER_FOOT_OFFSET = 35  # 玩家中心 → 脚底
@@ -45,6 +48,9 @@ ROPE_GRAB_DX = 30        # 平台边缘附近多少 px 内算"有梯子可爬"
 CLIMB_BURST = 0.6        # 巡逻爬梯单次脉冲秒数
 CLIMB_MAX_BURSTS = 8     # 单次爬梯最多脉冲数 (防卡死)
 
+JUMP_FAIL_LIMIT = 3      # 登台跳连跳几次仍不可打 → 临时放弃该目标 (防跳-loop 卡住)
+BLOCK_COOLDOWN = 4.0     # 放弃目标后的冷却秒数 (冷却期内不再尝试)
+
 FLAT_MODE = False        # True=关闭跳跃/爬梯, 纯平面推图
 
 
@@ -53,6 +59,21 @@ class PatrolMover:
         self.patrol_direction = Direction.RIGHT
         self._patrol_start_time = time.time()
         self._last_motion_t = time.time()   # 最近一次画面有动静的时间 (卡住检测)
+        self._jump_count = {}               # 目标粗网格key -> 连续登台跳次数
+        self._blocked = {}                  # 目标粗网格key -> 冷却截止时间 (防跳-loop)
+
+    @staticmethod
+    def _tkey(target):
+        """目标位置粗网格 key (容忍微动/抖动)。"""
+        return (target.cx // 60, target.cy // 60)
+
+    def _is_blocked(self, key) -> bool:
+        if key in self._blocked:
+            if time.time() >= self._blocked[key]:
+                self._blocked.pop(key, None)
+                return False
+            return True
+        return False
 
     # ===== 可及性判断 =====
 
@@ -72,7 +93,7 @@ class PatrolMover:
         if self._same_surface(px, pfeet, target.cx, tfeet, platforms):
             return True
         if (not FLAT_MODE) and dy > JUMP_UP_DY and dx <= JUMP_TO_UPPER_DX:
-            return True
+            return not self._is_blocked(self._tkey(target))   # 跳不上去冷却期内视为不可及
         if (not FLAT_MODE) and dy < -JUMP_DOWN_DY and dx <= JUMP_DOWN_DX:
             return True
         return False
@@ -95,7 +116,17 @@ class PatrolMover:
         dy = py - target.cy
         direction = Direction.RIGHT if target.cx >= px else Direction.LEFT
         if (not FLAT_MODE) and dy > JUMP_UP_DY and abs(dx) <= JUMP_TO_UPPER_DX:
-            log.info(f"↑ 登台跳 -> {target.name}")
+            key = self._tkey(target)
+            if self._is_blocked(key):
+                return  # 冷却期内不再跳, 交给巡逻 (用移动/地形找别的路)
+            cnt = self._jump_count.get(key, 0) + 1
+            self._jump_count[key] = cnt
+            if cnt >= JUMP_FAIL_LIMIT:
+                log.info(f"!! 登台跳 {cnt} 次仍不可打, 冷却该目标, 改巡逻 !!")
+                self._blocked[key] = time.time() + BLOCK_COOLDOWN
+                self._jump_count.pop(key, None)
+                return
+            log.info(f"↑ 登台跳({cnt}/{JUMP_FAIL_LIMIT}) -> {target.name}")
             controller.diagonal_jump(direction)
             return
         if (not FLAT_MODE) and dy < -JUMP_DOWN_DY and abs(dx) <= JUMP_DOWN_DX:
@@ -157,11 +188,15 @@ class PatrolMover:
             return
 
         nt = brain.nearest_target()
+        chase = False
         if nt is not None:
-            # 朝最近怪方向走 (覆盖可及性不足时, 巡逻主动靠近)
-            self.patrol_direction = Direction.RIGHT if nt.cx >= px else Direction.LEFT
-            self._patrol_start_time = time.time()
-        elif time.time() - self._patrol_start_time > PATROL_DURATION:
+            d = math.hypot(nt.cx - px, nt.cy - py)
+            if d <= PATROL_CHASE_RANGE:
+                # 附近怪才朝其方向走 (远处/异层怪不锁方向, 防被带偏一直走)
+                self.patrol_direction = Direction.RIGHT if nt.cx >= px else Direction.LEFT
+                self._patrol_start_time = time.time()
+                chase = True
+        if not chase and time.time() - self._patrol_start_time > PATROL_DURATION:
             self._flip()
 
         sup = self.support(px, py + PLAYER_FOOT_OFFSET, platforms)
