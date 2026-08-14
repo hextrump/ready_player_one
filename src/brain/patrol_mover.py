@@ -70,8 +70,11 @@ class PatrolMover:
 
     @staticmethod
     def _tkey(target):
-        """目标位置粗网格 key (容忍微动/抖动)。"""
-        return (target.cx // 60, target.cy // 60)
+        """目标身份 key (容忍微动/抖动)。优先用实体 id (跨帧稳定), 无 id 回退粗网格。"""
+        tid = getattr(target, "id", None)
+        if tid is not None:
+            return ("id", tid)
+        return ("grid", target.cx // 60, target.cy // 60)
 
     def _is_blocked(self, key) -> bool:
         if key in self._blocked:

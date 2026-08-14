@@ -30,6 +30,7 @@ from src.capture.window_capture import WindowCapture
 from src.brain.game_controller import GameController, Direction
 from src.brain.patrol_mover import PatrolMover
 from src.brain.action_executor import ActionExecutor
+from src.brain.entity_tracker import MonsterTracker
 from src.perception.hp_monitor import HPMonitor
 from src.brain.data_collector import DataCollector
 from src.perception.nametag_hsv_locator import NametagHSVLocator, NAMETAG_SCORE_OK_THRESHOLD as NAMETAG_MATCH_THRESHOLD
@@ -172,6 +173,9 @@ class CombatBrain:
         # 移动: PatrolMover (打→接近→巡逻 三层)
         self.mover = PatrolMover()
 
+        # 实体层: 怪物身份与生命周期 (跨帧存活, 替换像素距离 hack)
+        self.monster_tracker = MonsterTracker()
+
         # 眼手分离: 主循环决策 → 动作执行器 (独立线程) 执行按键
         self.controller = None        # run() 时注入
         self.executor = None          # run() 时创建
@@ -206,6 +210,13 @@ class CombatBrain:
                 self._frame_idx += 1
                 run_terrain = (self._frame_idx % TERRAIN_EVERY == 0)
                 targets, px, py, raw_results, platforms, ropes = self.find_targets(frame, run_terrain)
+
+                # 实体化: 给怪物稳定身份 (跨帧存活); 只暴露本帧观察到的实体给决策层
+                # (ghost 实体保留在 tracker 内维持身份, 不参与决策 → 不会去打空位)
+                targets = self.monster_tracker.update(targets)
+                targets = [t for t in targets if t.miss_frames == 0]
+                for t in targets:
+                    t.dist = math.hypot(t.cx - px, t.cy - py)
 
                 # 帧间运动量 (卡住检测): 玩家走动/相机滚动时画面一直变; 卡住时画面静止
                 gray_small = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -498,9 +509,10 @@ class CombatBrain:
             hit_count = 1
         else:
             # ===== Burst 连打循环 (提速核心) =====
-            # 锁住怪位置用于存活判定, 每 BURST_RECHECK 重新扫一次
+            # 锁住怪身份用于存活判定 (实体 id, 跨帧稳定; 无 id 回退位置), 每 BURST_RECHECK 重新扫一次
             controller.key_down(direction.value)
-            target_lock = (target.cx, target.cy)
+            target_id = getattr(target, "id", None)
+            target_lock = (target.cx, target.cy)  # 无实体 id 时回退像素锁定
             start_t = time.time()
             last_attack_t = 0.0
             last_check_t = 0.0
@@ -528,8 +540,11 @@ class CombatBrain:
                         target_alive = False
                         for t in cur_tgs:
                             if self.is_in_attack_range(t, cur_px, cur_py):
-                                # 距锁定位置 100px 内算同一只
-                                if abs(t.cx - target_lock[0]) < 100 and abs(t.cy - target_lock[1]) < 80:
+                                if target_id is not None and getattr(t, "id", None) == target_id:
+                                    target_alive = True   # 同一只怪 (身份, 跨帧稳定)
+                                    break
+                                # 无实体 id 时回退: 距锁定位置 100px 内算同一只
+                                if target_id is None and abs(t.cx - target_lock[0]) < 100 and abs(t.cy - target_lock[1]) < 80:
                                     target_alive = True
                                     break
                         if not target_alive:
