@@ -137,7 +137,9 @@ class HPMonitor:
         """找 HP/MP 条并扩展到全宽。以 MP 蓝条为锚, HP 红条只在 MP 左侧同行找。
         放宽到低血量小填充 (细条也能命中); 扩展后过窄 → 视为非条, 失败待下帧重试。"""
         h_img = frame.shape[0]
-        roi_top = int(h_img * 0.85)  # 条在底部 UI
+        # roi_top 0.85 会把条上方 y=655 附近的蓝色 UI 误当 MP 条 (真条在 ~98% 帧高);
+        # 收紧到 0.90 排除条上方内容, 只搜底部真条
+        roi_top = int(h_img * 0.90)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
         # MP 先找 (满条宽扁, 用高宽高比过滤方形技能图标)

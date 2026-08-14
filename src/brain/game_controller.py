@@ -252,6 +252,17 @@ class GameController:
         self.key_up(direction.value)
         self._post_action()
 
+    def edge_jump_up(self, direction: Direction) -> None:
+        """边缘上跳: 方向 + Alt, 空中保持方向稍久 (增大水平位移), 用于跳上相邻高平台。"""
+        self.key_down(direction.value)
+        time.sleep(0.03 + self._jitter())
+        self.key_down("alt")
+        time.sleep(0.03)
+        self.key_up("alt")
+        time.sleep(0.32 + self._jitter())  # 比斜跳多飘 ~0.2s, 更容易贴到高平台
+        self.key_up(direction.value)
+        self._post_action()
+
     def jump_down(self) -> None:
         """下跳: ↓ + Alt。"""
         self.key_down("down")
@@ -294,6 +305,15 @@ class GameController:
         time.sleep(0.1)
         self.key_up(direction.value)
         self._post_action()
+
+    def release_all_key(self) -> None:
+        """松开常用按键 (停止 bot 时兜底, 防止方向键被按住)。"""
+        for key in ("left", "right", "up", "down", "x", "alt", "a", "s", "j"):
+            try:
+                self.key_up(key)
+            except Exception:
+                pass
+        self._detach()
 
     # ── 内部 ──
 

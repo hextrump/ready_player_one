@@ -51,6 +51,11 @@ CLIMB_MAX_BURSTS = 8     # 单次爬梯最多脉冲数 (防卡死)
 JUMP_FAIL_LIMIT = 3      # 登台跳连跳几次仍不可打 → 临时放弃该目标 (防跳-loop 卡住)
 BLOCK_COOLDOWN = 4.0     # 放弃目标后的冷却秒数 (冷却期内不再尝试)
 
+# 边缘上跳 (从低平台跳到相邻高平台, 解决高低平台无梯子连不上导致的卡住)
+EDGE_JUMP_MAX_DY = 140   # 单次上跳能上的最大高度差 (游戏跳高 ~150)
+EDGE_JUMP_MAX_GAP = 60   # 高平台起点到当前边缘的最大水平缝隙 (单向平台可从下方跳上)
+EDGE_JUMP_COOLDOWN = 1.5 # 边缘上跳冷却 (防跳不上时热循环)
+
 FLAT_MODE = False        # True=关闭跳跃/爬梯, 纯平面推图
 
 
@@ -61,6 +66,7 @@ class PatrolMover:
         self._last_motion_t = time.time()   # 最近一次画面有动静的时间 (卡住检测)
         self._jump_count = {}               # 目标粗网格key -> 连续登台跳次数
         self._blocked = {}                  # 目标粗网格key -> 冷却截止时间 (防跳-loop)
+        self._last_edge_jump_t = 0.0        # 最近一次边缘上跳时间 (防热循环)
 
     @staticmethod
     def _tkey(target):
@@ -74,6 +80,23 @@ class PatrolMover:
                 return False
             return True
         return False
+
+    def _find_upper_platform(self, sup, edge_x, is_right, platforms):
+        """从 sup 平台边缘朝 is_right 侧找一块可单跳上去的更高平台 (y 更小), 无则 None。
+        冒险岛平台是单向的: 可从下方跳上, 故只需高平台 x 范围覆盖边缘附近即可。"""
+        sup_y = sup[0]
+        for p in platforms:
+            if p[0] >= sup_y - 40:              # 不是足够高的平台 (y 更大 = 更低)
+                continue
+            if sup_y - p[0] > EDGE_JUMP_MAX_DY: # 高度差超过单跳范围
+                continue
+            if is_right:
+                if p[1] <= edge_x + EDGE_JUMP_MAX_GAP and p[2] >= edge_x:
+                    return p
+            else:
+                if p[2] >= edge_x - EDGE_JUMP_MAX_GAP and p[1] <= edge_x:
+                    return p
+        return None
 
     # ===== 可及性判断 =====
 
@@ -110,8 +133,9 @@ class PatrolMover:
     # ===== 接近 (只处理直接可及) =====
 
     def approach(self, controller: GameController, target, px: int, py: int,
-                 platforms: list, brain) -> None:
-        """简单接近: 同面 → 水平走; 上近 → 登台跳; 下近 → 下跳。做完交给外层重决策。"""
+                 platforms: list, brain, cancel=None) -> None:
+        """简单接近: 同面 → 水平走; 上近 → 登台跳 (先贴近平台边缘再跳); 下近 → 下跳。做完交给外层重决策。
+        cancel: 可选回调, True=决策已变更, 中止走动。"""
         dx = target.cx - px
         dy = py - target.cy
         direction = Direction.RIGHT if target.cx >= px else Direction.LEFT
@@ -119,6 +143,16 @@ class PatrolMover:
             key = self._tkey(target)
             if self._is_blocked(key):
                 return  # 冷却期内不再跳, 交给巡逻 (用移动/地形找别的路)
+            # 若该侧存在可跳上的高平台, 且离平台边缘还远 → 先走向边缘, 贴近了再跳
+            # (单次斜跳水平位移有限, 从中间起跳上不去, 是之前卡住的根因)
+            sup = self.support(px, py + PLAYER_FOOT_OFFSET, platforms)
+            is_right = direction == Direction.RIGHT
+            if sup is not None:
+                edge_x = sup[2] if is_right else sup[1]
+                up = self._find_upper_platform(sup, edge_x, is_right, platforms)
+                if up is not None and abs(px - edge_x) > EDGE_JUMP_MAX_GAP + 20:
+                    self._walk_toward(controller, edge_x, px, brain, cancel)
+                    return
             cnt = self._jump_count.get(key, 0) + 1
             self._jump_count[key] = cnt
             if cnt >= JUMP_FAIL_LIMIT:
@@ -133,9 +167,10 @@ class PatrolMover:
             log.info(f"↓ 下跳 -> {target.name}")
             controller.jump_down()
             return
-        self._walk_toward(controller, target.cx, px, brain)
+        self._walk_toward(controller, target.cx, px, brain, cancel)
 
-    def _walk_toward(self, controller: GameController, goal_x: int, px: int, brain) -> None:
+    def _walk_toward(self, controller: GameController, goal_x: int, px: int, brain,
+                     cancel=None) -> None:
         """水平走向 goal_x: 进范围/到达/超时 即停。
         仅在玩家位置可信时做脱困跳 (中心猜测时位置冻结, 会误判卡住狂跳)。"""
         direction = Direction.RIGHT if goal_x >= px else Direction.LEFT
@@ -146,6 +181,8 @@ class PatrolMover:
         controller.key_down(direction.value)
         try:
             while time.time() - start < APPROACH_MAX_SEC:
+                if cancel and cancel():
+                    break
                 if brain.any_target_in_range():
                     break
                 cur_px = brain.player_pos()[0]
@@ -173,9 +210,11 @@ class PatrolMover:
     # ===== 巡逻 (地形实时生成) =====
 
     def patrol(self, controller: GameController, px: int, py: int,
-               platforms: list, ropes: list, brain) -> None:
+               platforms: list, ropes: list, brain, cancel=None) -> None:
         """地形巡逻: 沿平台走, 到边缘 爬梯/换向; 方向朝最近怪偏置。
         卡住检测: 名牌失效时玩家坐标不更新, 用"画面是否静止"判断玩家是否真的在动。"""
+        if cancel and cancel():
+            return
         # 卡住检测: 一直在走但画面静止 (相机不动=玩家被卡住, 名牌失效也能用)
         if brain.world_moving():
             self._last_motion_t = time.time()
@@ -202,28 +241,40 @@ class PatrolMover:
         sup = self.support(px, py + PLAYER_FOOT_OFFSET, platforms)
         if sup is not None:
             if self.patrol_direction == Direction.RIGHT and px >= sup[2] - WALK_EDGE_MARGIN:
-                self._at_edge(controller, px, py, ropes, sup, True, brain)
+                self._at_edge(controller, px, py, ropes, sup, True, brain, platforms, cancel)
                 return
             if self.patrol_direction == Direction.LEFT and px <= sup[1] + WALK_EDGE_MARGIN:
-                self._at_edge(controller, px, py, ropes, sup, False, brain)
+                self._at_edge(controller, px, py, ropes, sup, False, brain, platforms, cancel)
                 return
 
         controller.move_direction(self.patrol_direction, duration=PATROL_STEP)
 
         # 附近有怪才普攻 (否则纯走路, 防空挥)
+        if cancel and cancel():
+            return
         if brain.any_target_near(PATROL_ATTACK_RANGE):
             controller.attack_single()
 
     def _at_edge(self, controller: GameController, px: int, py: int, ropes: list,
-                 sup: tuple, is_right: bool, brain) -> None:
-        """到平台边缘: 有梯子 → 爬梯换层 (方向偏置); 否则换向。"""
+                 sup: tuple, is_right: bool, brain, platforms, cancel=None) -> None:
+        """到平台边缘: 有梯子 → 爬梯换层; 无梯子但相邻有可跳上的高平台 → 边缘上跳; 否则换向。"""
         edge_x = sup[2] if is_right else sup[1]
         rope = self._rope_near(ropes, edge_x)
         if rope is not None:
             up = self._climb_bias(brain, py)
             log.info(f"🧗 巡逻爬梯 {'上' if up else '下'} (x={rope[0]})")
-            self._climb(controller, rope, up, brain)
+            self._climb(controller, rope, up, brain, cancel)
             return
+        # 无梯子: 尝试边缘上跳 (从低平台跳到相邻高平台), 冷却期内/无高平台才换向
+        if cancel and cancel():
+            return
+        if time.time() - self._last_edge_jump_t >= EDGE_JUMP_COOLDOWN:
+            up = self._find_upper_platform(sup, edge_x, is_right, platforms)
+            if up is not None:
+                self._last_edge_jump_t = time.time()
+                log.info(f"↑ 边缘上跳 -> 高平台 y={up[0]} @ x=[{up[1]},{up[2]}]")
+                controller.edge_jump_up(Direction.RIGHT if is_right else Direction.LEFT)
+                return
         self._flip()
 
     def _rope_near(self, ropes: list, x: int):
@@ -243,10 +294,13 @@ class PatrolMover:
                 return False
         return True
 
-    def _climb(self, controller: GameController, rope: tuple, up: bool, brain) -> None:
+    def _climb(self, controller: GameController, rope: tuple, up: bool, brain,
+               cancel=None) -> None:
         """在梯子处短脉冲攀爬, 进范围或到顶/底或超时停。"""
         rx, rtop, rbot = rope
         for _ in range(CLIMB_MAX_BURSTS):
+            if cancel and cancel():
+                return
             if brain.any_target_in_range():
                 return
             cur_py = brain.player_pos()[1]

@@ -48,19 +48,20 @@ def letterbox_array(img_array, target: Tuple[int, int]):
     """对 numpy BGR 数组做 letterbox, 返回 (resized_array, scale, pad_left, pad_top).
 
     用于 window_capture 实时 letterbox.
+    用 cv2.resize (比 PIL 快一个数量级, 实时抓帧热路径; PIL 版 1600x900 一次 0.076s)。
     """
+    import cv2
     import numpy as np
     h, w = img_array.shape[:2]
     tw, th = target
     scale = min(tw / w, th / h)
     nw, nh = int(w * scale), int(h * scale)
 
-    img_resized = Image.fromarray(img_array[:, :, ::-1])  # BGR -> RGB
-    img_resized = img_resized.resize((nw, nh), Image.BILINEAR)
+    img_resized = cv2.resize(img_array, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-    canvas = Image.new("RGB", (tw, th), CANVAS_COLOR)
+    canvas = np.full((th, tw, 3), CANVAS_COLOR, dtype=np.uint8)
     pad_left = (tw - nw) // 2
     pad_top = (th - nh) // 2
-    canvas.paste(img_resized, (pad_left, pad_top))
+    canvas[pad_top:pad_top + nh, pad_left:pad_left + nw] = img_resized
 
-    return np.array(canvas)[:, :, ::-1].copy(), scale, pad_left, pad_top
+    return canvas, scale, pad_left, pad_top

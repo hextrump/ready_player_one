@@ -29,6 +29,7 @@ from ultralytics import YOLO
 from src.capture.window_capture import WindowCapture
 from src.brain.game_controller import GameController, Direction
 from src.brain.patrol_mover import PatrolMover
+from src.brain.action_executor import ActionExecutor
 from src.perception.hp_monitor import HPMonitor
 from src.brain.data_collector import DataCollector
 from src.perception.nametag_hsv_locator import NametagHSVLocator, NAMETAG_SCORE_OK_THRESHOLD as NAMETAG_MATCH_THRESHOLD
@@ -87,6 +88,8 @@ MODEL_MONSTER = "models/monster_v19.pt"
 MODEL_TERRAIN = "models/super_brain_v13_merged.pt"
 IMGSZ_MONSTER = 640   # v19 训练尺寸
 IMGSZ_TERRAIN = 640   # v13 地形用 640 已足够 (平台/梯子检出与 960 一致), 省算力保帧率
+MONSTER_MIN_SIZE = 30 # 怪物框最小宽/高 (原 20; 打猪时地面掉落物/小杂物误识别多, 调大过滤)
+TERRAIN_EVERY = 3     # 地形(平台/梯子)每 N 帧跑一次 (地形基本不动, 中间帧用旧结果省算力)
 
 # 地形过滤阈值 (离线实测校准: 滤掉顶部 UI 噪声与低置信度碎块)
 PLATFORM_CONF = 0.4        # 平台最低置信度
@@ -137,6 +140,11 @@ class CombatBrain:
         except Exception as e:
             log.error(f"地形模型加载失败: {e}")
 
+        # 地形结果缓存 (错帧跳过时复用, 平台/梯子基本不动)
+        self._cached_platforms = []
+        self._cached_ropes = []
+        self._frame_idx = 0  # 感知帧计数 (地形错帧用)
+
         # 定时心跳截图 (数据收集, 仅常规样本)
         self.data_collector = DataCollector()
 
@@ -161,6 +169,10 @@ class CombatBrain:
 
         # 移动: PatrolMover (打→接近→巡逻 三层)
         self.mover = PatrolMover()
+
+        # 眼手分离: 主循环决策 → 动作执行器 (独立线程) 执行按键
+        self.controller = None        # run() 时注入
+        self.executor = None          # run() 时创建
 
         # 兜底定时器节流时间戳
         self._last_hp_potion_time = time.time()  # HP 药水兜底节流时间戳
@@ -188,8 +200,10 @@ class CombatBrain:
                     time.sleep(0.1)
                     continue
 
-                # 运行核心检测 (双模型: v19 怪 + v13 地形/玩家)
-                targets, px, py, raw_results, platforms, ropes = self.find_targets(frame)
+                # 运行核心检测 (双模型: v19 怪每帧 + v13 地形/玩家错帧)
+                self._frame_idx += 1
+                run_terrain = (self._frame_idx % TERRAIN_EVERY == 0)
+                targets, px, py, raw_results, platforms, ropes = self.find_targets(frame, run_terrain)
 
                 # 帧间运动量 (卡住检测): 玩家走动/相机滚动时画面一直变; 卡住时画面静止
                 gray_small = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -226,9 +240,10 @@ class CombatBrain:
                 log.error(f"[VISION] 感知线程单帧异常: {e}", exc_info=True)
                 time.sleep(0.5)
 
-    def find_targets(self, frame) -> tuple[List[Target], int, int, Optional[object], list, list]:
+    def find_targets(self, frame, run_terrain: bool = True) -> tuple[List[Target], int, int, Optional[object], list, list]:
         """双模型感知: 玩家位置名牌锚定(v13 Player 兜底), 怪由 v19 检测,
-        地形(平台/梯子)由 v13 提供。返回 (targets, px, py, raw_results, platforms, ropes)。"""
+        地形(平台/梯子)由 v13 提供。返回 (targets, px, py, raw_results, platforms, ropes)。
+        run_terrain=False: 跳过地形模型 (错帧), 用缓存的地形结果。"""
         player_x, player_y = self._cached_player_pos
         raw_results = None
         platforms = []     # (y, x_left, x_right) 行走面
@@ -270,29 +285,36 @@ class CombatBrain:
                     # 大位移但得分平庸 → 很可能是其它玩家的名牌, 不锁它 (走漏检衰减兜底)
                     pass
 
-        # ── 地形 + 玩家兜底: v13 模型 ──
+        # ── 地形 + 玩家兜底: v13 模型 (错帧: 每隔 TERRAIN_EVERY 帧跑一次, 中间用缓存) ──
         if self.terrain_model:
-            tres = self.terrain_model(frame, conf=0.15, imgsz=IMGSZ_TERRAIN, verbose=False)[0]
-            for box in tres.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                name = tres.names[int(box.cls[0])]
-                conf = float(box.conf[0])
-                w, h = x2 - x1, y2 - y1
-                if name == "Platform" and conf >= PLATFORM_CONF and w >= PLATFORM_MIN_W and y1 >= PLATFORM_UI_CUT:
-                    platforms.append(((y1 + y2) // 2, x1, x2))
-                elif name == "Rope" and conf >= ROPE_CONF and h >= ROPE_MIN_H:
-                    ropes.append(((x1 + x2) // 2, y1, y2))
-                elif name == "Player" and conf >= V13_PLAYER_CONF:
-                    if V13_PLAYER_MIN_SIZE <= w <= V13_PLAYER_MAX_SIZE and V13_PLAYER_MIN_SIZE <= h <= V13_PLAYER_MAX_SIZE:
-                        player_cand = ((x1 + x2) // 2, (y1 + y2) // 2)
-            # 梯子按 x 聚类去重 (同一梯子 x 抖动 ±12px)
-            ropes.sort(key=lambda r: r[0])
-            dedup = []
-            for r in ropes:
-                if dedup and abs(r[0] - dedup[-1][0]) <= ROPE_DEDUP_DX:
-                    continue
-                dedup.append(r)
-            ropes = dedup
+            if run_terrain:
+                tres = self.terrain_model(frame, conf=0.15, imgsz=IMGSZ_TERRAIN, verbose=False)[0]
+                for box in tres.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    name = tres.names[int(box.cls[0])]
+                    conf = float(box.conf[0])
+                    w, h = x2 - x1, y2 - y1
+                    if name == "Platform" and conf >= PLATFORM_CONF and w >= PLATFORM_MIN_W and y1 >= PLATFORM_UI_CUT:
+                        platforms.append(((y1 + y2) // 2, x1, x2))
+                    elif name == "Rope" and conf >= ROPE_CONF and h >= ROPE_MIN_H:
+                        ropes.append(((x1 + x2) // 2, y1, y2))
+                    elif name == "Player" and conf >= V13_PLAYER_CONF:
+                        if V13_PLAYER_MIN_SIZE <= w <= V13_PLAYER_MAX_SIZE and V13_PLAYER_MIN_SIZE <= h <= V13_PLAYER_MAX_SIZE:
+                            player_cand = ((x1 + x2) // 2, (y1 + y2) // 2)
+                # 梯子按 x 聚类去重 (同一梯子 x 抖动 ±12px)
+                ropes.sort(key=lambda r: r[0])
+                dedup = []
+                for r in ropes:
+                    if dedup and abs(r[0] - dedup[-1][0]) <= ROPE_DEDUP_DX:
+                        continue
+                    dedup.append(r)
+                ropes = dedup
+                self._cached_platforms = platforms
+                self._cached_ropes = ropes
+            else:
+                # 错帧: 复用上次地形结果 (平台/梯子基本不动, 0.3s 内足够移动用)
+                platforms = self._cached_platforms
+                ropes = self._cached_ropes
 
         # ── 玩家位置: 名牌 miss → v13 Player 兜底 → 画面中心衰减 ──
         used_v13 = False
@@ -346,7 +368,7 @@ class CombatBrain:
                 if name != "Monster":
                     continue
                 # 门槛: 信心度 + 尺寸 (防把地上掉落物当怪)
-                if conf < 0.2 or w < 20 or h < 20:
+                if conf < 0.2 or w < MONSTER_MIN_SIZE or h < MONSTER_MIN_SIZE:
                     continue
                 # 冲突过滤: 怪框与玩家区域重叠 >30% → 视为玩家自己被误检
                 ix1, iy1 = max(player_excl[0], x1), max(player_excl[1], y1)
@@ -456,8 +478,10 @@ class CombatBrain:
         with self._vision_lock:
             return self._player_reliable
 
-    def _attack(self, controller: GameController, target: Target, px: int, py: int) -> int:
-        """发动攻击: 区分地面 burst 连打和空中跳发补刀。"""
+    def _attack(self, controller: GameController, target: Target, px: int, py: int,
+                cancel=None) -> int:
+        """发动攻击: 区分地面 burst 连打和空中跳发补刀。
+        cancel: 可选回调, 返回 True 表示决策已变更, 应中止当前攻击。"""
         direction = self.get_direction_to_target(target, px)
         dy = py - target.cy
 
@@ -481,6 +505,11 @@ class CombatBrain:
                 next_interval = max(0.06, random.gauss(BURST_INTERVAL, BURST_JITTER))
                 while time.time() - start_t < BURST_TIMEOUT:
                     now = time.time()
+
+                    # 决策已变更 (新目标/换行动) → 中止当前 burst
+                    if cancel and cancel():
+                        log.info(f"[ATTACK] 决策变更,中止 burst (共 {hit_count} 下)")
+                        break
 
                     # 每 BURST_RECHECK 重新从视觉线程拉最新目标,死了就走
                     if now - last_check_t >= BURST_RECHECK:
@@ -524,9 +553,53 @@ class CombatBrain:
         log.info(f"[ATTACK] {target.name} × {hit_count} 击 @ ({target.cx},{target.cy})")
         return hit_count
 
+    def _decide(self, perc: dict) -> tuple:
+        """三层优先决策 (不执行动作, 只返回命令): 打 → 接近(直接可及) → 地形巡逻。"""
+        targets = perc["targets"]
+        px, py = perc["player_x"], perc["player_y"]
+        platforms = perc.get("platforms", [])
+        if not self.active_hunting:
+            self.state = BrainState.STANDBY
+            return ("none", None)
+        if targets:
+            best = self.select_target(targets, px, py)
+            if best and self.is_in_attack_range(best, px, py):
+                self.state = BrainState.ATTACKING
+                return ("attack", best)
+            if best and self.mover.is_reachable(best, px, py, platforms):
+                self.state = BrainState.APPROACHING
+                return ("approach", best)
+        self.state = BrainState.PATROLLING
+        return ("patrol", None)
+
+    def _action_worker(self, action_id: int, action: tuple) -> None:
+        """动作执行 (ActionExecutor 线程内): 读最新感知, 分发到具体动作; 支持 cancel 中断。"""
+        atype, payload = action
+        controller = self.controller
+        if controller is None:
+            return
+        cancel = lambda: self.executor.is_cancelled(action_id)
+        # 动作开始时读最新感知 (动作内部如需最新数据会自行再读)
+        with self._vision_lock:
+            perc = self._latest_perception
+            px, py = perc.get("player_x", PLAYER_X), perc.get("player_y", PLAYER_Y)
+            platforms = perc.get("platforms", [])
+            ropes = perc.get("ropes", [])
+        try:
+            if atype == "attack" and payload is not None:
+                self._attack(controller, payload, px, py, cancel)
+            elif atype == "approach" and payload is not None:
+                self.mover.approach(controller, payload, px, py, platforms, self, cancel)
+            elif atype == "patrol":
+                self.mover.patrol(controller, px, py, platforms, ropes, self, cancel)
+            # "none" 待机: 无需动作
+        except Exception as e:
+            log.error(f"[EXEC] 动作执行异常: {e}", exc_info=True)
+
     def run(self, capture: WindowCapture, controller: GameController, hp_monitor: Optional[HPMonitor] = None, show_vision: bool = True):
-        """主战斗循环 (V7: 感知 → 决策 → 动作, 无导航)。"""
+        """主循环 (眼手分离): 每帧感知 → 决策 → 推送命令 → 画 viz, 不再被动作阻塞 (~10fps)。"""
         self._running = True
+        self.controller = controller
         log.info("=== Combat Brain V8 (v19 认怪 + v13 地形 + 地形感知移动) ONLINE ===")
         log.info(f"State: {self.state.value}")
 
@@ -536,8 +609,9 @@ class CombatBrain:
         if show_vision:
             cv2.namedWindow("Agent V7 Vision", cv2.WINDOW_NORMAL)
 
-        # 启动后台视觉线程
+        # 启动后台视觉线程 + 动作执行线程 (眼手分离)
         threading.Thread(target=self._perception_loop, args=(capture,), daemon=True).start()
+        self.executor = ActionExecutor(self._action_worker)
 
         while self._running:
             t0 = time.time() # 用于画面 FPS 显示统计
@@ -565,37 +639,21 @@ class CombatBrain:
                 controller.tap_key("j")
                 self._last_pet_feed_time = time.time()
 
-            platforms = perc.get("platforms", [])
-            ropes = perc.get("ropes", [])
+            # 决策 → 推送动作 (ActionExecutor 内部按粗网格键去重, 动作不重复执行不被打断)
+            action = self._decide(perc)
+            self.executor.set_action(action)
 
-            # ==== 三层优先: 打 → 接近(直接可及) → 地形巡逻 ====
-            if not self.active_hunting:
-                self.state = BrainState.STANDBY
-            elif targets:
-                best = self.select_target(targets, px, py)
-                if best and self.is_in_attack_range(best, px, py):
-                    self.state = BrainState.ATTACKING
-                    self._attack(controller, best, px, py)
-                elif best and self.mover.is_reachable(best, px, py, platforms):
-                    self.state = BrainState.APPROACHING
-                    self.mover.approach(controller, best, px, py, platforms, self)
-                else:
-                    self.state = BrainState.PATROLLING
-                    self.mover.patrol(controller, px, py, platforms, ropes, self)
-            else:
-                self.state = BrainState.PATROLLING
-                self.mover.patrol(controller, px, py, platforms, ropes, self)
-
-            # 渲染可视化界面
+            # 渲染可视化界面 (每帧, 不再被动作阻塞)
             if show_vision:
                 key = self._draw_vision(frame, targets, px, py, t0, hp_monitor)
                 if key is not None and (key & 0xFF) == ord('q'):
                     self._running = False
                     break
                 self._handle_vision_key(key)
-            else:
-                # 短暂等待避免操作过于频繁
-                time.sleep(0.08)
+
+            # 限频 ~10fps (决策循环稳定跑, 感知变更立刻反映到决策)
+            elapsed = time.time() - t0
+            time.sleep(max(0.005, 0.1 - elapsed))
 
     def _draw_vision(self, frame, targets, px, py, t0, hp_monitor) -> Optional[int]:
         """绘制 Agent V7 可视化 HUD, 返回 cv2.waitKey(1) 按键值 (供 run() 处理 q/名牌校准)。"""
@@ -695,5 +753,13 @@ class CombatBrain:
 
     def stop(self):
         self._running = False
+        if self.executor is not None:
+            self.executor.stop()  # 触发当前动作中断
+        # 兜底松开可能被按住的键
+        if self.controller is not None:
+            try:
+                self.controller.release_all_key()
+            except Exception:
+                pass
         log.info(f"Combat Brain stopped. Total attacks: {self.kill_count}")
         cv2.destroyAllWindows()
