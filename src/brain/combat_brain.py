@@ -620,8 +620,11 @@ class CombatBrain:
         threading.Thread(target=self._perception_loop, args=(capture,), daemon=True).start()
         self.executor = ActionExecutor(self._action_worker)
 
+        last_loop_t = time.time()  # 上一轮循环起点 (算真实 fps, 含限频 sleep)
         while self._running:
             t0 = time.time() # 用于画面 FPS 显示统计
+            loop_fps = 1.0 / max(0.001, t0 - last_loop_t)  # 完整循环周期 (含 sleep) → ~10fps
+            last_loop_t = t0
             # 获取最新感知数据 (不阻塞)
             with self._vision_lock:
                 perc = self._latest_perception.copy()
@@ -652,7 +655,7 @@ class CombatBrain:
 
             # 渲染可视化界面 (每帧, 不再被动作阻塞)
             if show_vision:
-                key = self._draw_vision(frame, targets, px, py, t0, hp_monitor)
+                key = self._draw_vision(frame, targets, px, py, loop_fps, hp_monitor)
                 if key is not None and (key & 0xFF) == ord('q'):
                     self._running = False
                     break
@@ -662,8 +665,9 @@ class CombatBrain:
             elapsed = time.time() - t0
             time.sleep(max(0.005, 0.1 - elapsed))
 
-    def _draw_vision(self, frame, targets, px, py, t0, hp_monitor) -> Optional[int]:
-        """绘制 Agent V7 可视化 HUD, 返回 cv2.waitKey(1) 按键值 (供 run() 处理 q/名牌校准)。"""
+    def _draw_vision(self, frame, targets, px, py, fps, hp_monitor) -> Optional[int]:
+        """绘制 Agent V7 可视化 HUD, 返回 cv2.waitKey(1) 按键值 (供 run() 处理 q/名牌校准)。
+        fps: 主循环真实帧率 (含限频 sleep, ~10fps)。"""
         vis_frame = frame.copy()
 
         # 绘制玩家位置 (红色十字, 校准确认用)
@@ -695,13 +699,10 @@ class CombatBrain:
             rope = self._latest_perception.get("ropes", [])
         for p in plat:
             cv2.rectangle(vis_frame, (p[1], p[0] - 3), (p[2], p[0] + 3), (0, 165, 255), -1)
-            cv2.putText(vis_frame, "PLAT", (p[1], p[0] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1)
         for r in rope:
             cv2.rectangle(vis_frame, (r[0] - 5, r[1]), (r[0] + 5, r[2]), (0, 255, 255), 3)
-            cv2.putText(vis_frame, "ROPE", (r[0] - 14, r[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
-        # 绘制状态和帧率
-        fps = 1.0 / max(0.001, time.time() - t0)
+        # 绘制状态和帧率 (fps 由主循环按完整周期传入, ~10)
         status_color = (0, 0, 255) if not self.active_hunting else (0, 255, 0)
         status_text = f"State: {self.state.value} | FPS: {fps:.0f} | Kills: {self.kill_count}"
         cv2.putText(vis_frame, "ACTIVE" if self.active_hunting else "STANDBY (Press F1 to Start, F to Stop)",
@@ -713,9 +714,6 @@ class CombatBrain:
             ok_str = "OK" if nl.last_score < NAMETAG_MATCH_THRESHOLD else "MISS"
             cv2.putText(vis_frame, f"NAMETAG {ok_str} score={nl.last_score:.2f}",
                         (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            # HSV 版本无 offset (无模板, 偏移硬编码在 HEAD_OFFSET_Y)
-            cv2.putText(vis_frame, "HSV locator (no template needed)",
-                        (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         # 处理 HP/MP 显示
         if hp_monitor:
@@ -726,14 +724,12 @@ class CombatBrain:
             cv2.putText(vis_frame, hp_text, (20, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             cv2.putText(vis_frame, mp_text, (20, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
 
-            # 在画面上画出监控遮罩，让用户检查
+            # 在画面上画出监控遮罩，让用户检查 (只画框线, 不标文字)
             if hp_monitor.is_calibrated:
                 hx, hy, hw, hh = hp_monitor.hp_bbox
                 mx, my, mw, mh = hp_monitor.mp_bbox
                 cv2.rectangle(vis_frame, (hx, hy), (hx + hw, hy + hh), (0, 0, 255), 2)
-                cv2.putText(vis_frame, "HP BOX", (hx, hy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                 cv2.rectangle(vis_frame, (mx, my), (mx + mw, my + mh), (255, 0, 0), 2)
-                cv2.putText(vis_frame, "MP BOX", (mx, my - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
                 # 【响应用户】：视频直接遮罩 (Video direct mask overlay)
                 if hasattr(hp_monitor, 'last_hp_mask') and hp_monitor.last_hp_mask is not None:
