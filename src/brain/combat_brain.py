@@ -88,7 +88,9 @@ MODEL_MONSTER = "models/monster_v19.pt"
 MODEL_TERRAIN = "models/super_brain_v13_merged.pt"
 IMGSZ_MONSTER = 640   # v19 训练尺寸
 IMGSZ_TERRAIN = 640   # v13 地形用 640 已足够 (平台/梯子检出与 960 一致), 省算力保帧率
-MONSTER_MIN_SIZE = 30 # 怪物框最小宽/高 (原 20; 打猪时地面掉落物/小杂物误识别多, 调大过滤)
+MONSTER_MIN_SIZE = 45 # 怪物框最小宽/高 (滤金币/小杂物; 实测真猪最小宽 46, 不能调太大否则滤掉猪)
+MONSTER_ASPECT_MIN = 0.45  # 宽/高下限: 滤窄长条(宠物) — 实测真猪宽高比 >=0.55, 宠物 0.35~0.45
+MONSTER_ASPECT_MAX = 2.2   # 宽/高上限: 滤过宽(群怪/杂物堆)
 TERRAIN_EVERY = 3     # 地形(平台/梯子)每 N 帧跑一次 (地形基本不动, 中间帧用旧结果省算力)
 
 # 地形过滤阈值 (离线实测校准: 滤掉顶部 UI 噪声与低置信度碎块)
@@ -369,6 +371,10 @@ class CombatBrain:
                     continue
                 # 门槛: 信心度 + 尺寸 (防把地上掉落物当怪)
                 if conf < 0.2 or w < MONSTER_MIN_SIZE or h < MONSTER_MIN_SIZE:
+                    continue
+                # 宽高比: 滤窄长条(宠物) 与 过宽(群怪/杂物堆) — 实测真猪 0.55~1.57
+                aspect = w / h
+                if aspect < MONSTER_ASPECT_MIN or aspect > MONSTER_ASPECT_MAX:
                     continue
                 # 冲突过滤: 怪框与玩家区域重叠 >30% → 视为玩家自己被误检
                 ix1, iy1 = max(player_excl[0], x1), max(player_excl[1], y1)
