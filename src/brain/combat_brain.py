@@ -600,6 +600,7 @@ class CombatBrain:
         """主循环 (眼手分离): 每帧感知 → 决策 → 推送命令 → 画 viz, 不再被动作阻塞 (~10fps)。"""
         self._running = True
         self.controller = controller
+        self.capture = capture
         log.info("=== Combat Brain V8 (v19 认怪 + v13 地形 + 地形感知移动) ONLINE ===")
         log.info(f"State: {self.state.value}")
 
@@ -759,6 +760,12 @@ class CombatBrain:
         if self.controller is not None:
             try:
                 self.controller.release_all_key()
+            except Exception:
+                pass
+        # 停止 DXGI 抓帧线程 (释放资源)
+        if getattr(self, 'capture', None) is not None:
+            try:
+                self.capture.stop()
             except Exception:
                 pass
         log.info(f"Combat Brain stopped. Total attacks: {self.kill_count}")

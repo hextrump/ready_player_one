@@ -100,6 +100,13 @@ class WindowCapture:
         self._minimap_region: tuple[int, int, int, int] = (0, 0, 200, 150)
         self._lock = threading.Lock()
 
+        # DXGI 抓帧 (windows_capture 库, 比 PrintWindow/BitBlt 快一个数量级)
+        # 初始化失败时回退原有 PrintWindow/BitBlt 路径
+        self._dxgi = None
+        self._dxgi_control = None
+        self._dxgi_frame = None
+        self._dxgi_ok = False
+
     def find_window(self) -> bool:
         """
         查找游戏窗口。优先按进程名，备选按窗口标题。
@@ -127,6 +134,9 @@ class WindowCapture:
         title = win32gui.GetWindowText(self._hwnd)
         log.info(f"找到窗口: hwnd={self._hwnd}, title='{title}', "
                  f"size={self._width}x{self._height}")
+
+        # 尝试 DXGI 抓帧 (失败自动回退 PrintWindow/BitBlt)
+        self._init_dxgi()
         return True
 
     def _update_size(self) -> None:
@@ -159,9 +169,59 @@ class WindowCapture:
             pass
         return result[0]
 
+    # ── DXGI 抓帧 (windows_capture 库, 比 PrintWindow/BitBlt 快一个数量级) ──
+
+    def _init_dxgi(self) -> bool:
+        """初始化 DXGI 抓帧。失败返回 False (调用方回退 PrintWindow/BitBlt)。"""
+        if not self._hwnd:
+            return False
+        try:
+            from windows_capture import WindowsCapture
+            title = win32gui.GetWindowText(self._hwnd)
+            if not title:
+                return False
+            self._dxgi = WindowsCapture(window_name=title)
+            self._dxgi.event(self.on_frame_arrived)  # 处理器方法名必须精确匹配
+            self._dxgi.event(self.on_closed)
+            self._dxgi_control = self._dxgi.start_free_threaded()
+            # 等第一帧 (最多 ~2s)
+            for _ in range(40):
+                if self._dxgi_frame is not None:
+                    self._dxgi_ok = True
+                    break
+                time.sleep(0.05)
+            if self._dxgi_ok:
+                log.info("DXGI 抓帧已启用 (windows_capture)")
+            else:
+                log.warning("DXGI 抓帧未收到帧, 回退 PrintWindow/BitBlt")
+            return self._dxgi_ok
+        except Exception as e:
+            log.warning(f"DXGI 抓帧初始化失败, 回退 PrintWindow/BitBlt: {e}")
+            self._dxgi = None
+            self._dxgi_ok = False
+            return False
+
+    def on_frame_arrived(self, frame, capture_control):
+        """windows_capture 帧回调 (方法名必须精确匹配, 库按名字分发)。"""
+        with self._lock:
+            self._dxgi_frame = frame.frame_buffer
+
+    def on_closed(self):
+        self._dxgi_ok = False
+
+    def stop(self):
+        """停止抓帧线程 (释放 DXGI 资源)。"""
+        if self._dxgi_control is not None:
+            try:
+                self._dxgi_control.stop()
+            except Exception:
+                pass
+            self._dxgi_control = None
+        self._dxgi_ok = False
+
     def grab(self) -> np.ndarray:
         """
-        后台截取游戏窗口客户区 (PrintWindow)。
+        后台截取游戏窗口客户区。优先 DXGI (windows_capture), 失败回退 PrintWindow/BitBlt。
 
         即使窗口被其他窗口遮挡也能正常截取。
 
@@ -171,6 +231,23 @@ class WindowCapture:
         with self._lock:
             if not self._hwnd or not win32gui.IsWindow(self._hwnd):
                 raise RuntimeError("窗口句柄无效，请先调用 find_window()")
+
+            # DXGI 优先 (此锁已被 grab 持有, 直接读 self._dxgi_frame, 不再加锁避免死锁)
+            if self._dxgi_ok:
+                f = self._dxgi_frame
+                if f is not None:
+                    try:
+                        bgr = cv2.cvtColor(f, cv2.COLOR_BGRA2BGR)
+                        h, w = bgr.shape[:2]
+                        ch, cw = self._height, self._width
+                        if ch > 0 and cw > 0 and ch <= h and cw <= w:
+                            title_h = max(0, h - ch)  # 标题栏高度
+                            client_frame = bgr[title_h:title_h + ch, 0:cw]
+                            if self.target_size is not None:
+                                client_frame, _, _, _ = letterbox_array(client_frame, self.target_size)
+                            return client_frame
+                    except Exception as e:
+                        log.warning(f"DXGI 帧处理失败, 回退 PrintWindow/BitBlt: {e}")
 
             # 刷新尺寸
             self._update_size()
