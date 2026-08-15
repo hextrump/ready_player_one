@@ -35,6 +35,49 @@ class Monster:
     last_seen: float = 0.0 # 最近一次被观察到的时间
 
 
+@dataclass
+class PlayerState:
+    """玩家实体: 位置 + 收敛状态 (名牌/v13/衰减 三源收敛到一个状态)。
+
+    替代 combat_brain 里散落的 _cached_player_pos/_player_pending/_player_miss_frames/_player_reliable。
+    收敛协议 (与原来完全一致):
+    - confirm: 小位移直接提交 / 大位移两帧成立 / v13 兜底命中 → 重置候选与漏检。
+    - propose: 大位移候选第一帧挂起, 等下一帧同位置确认 (防锁到其它玩家名牌)。
+    - reject:  本帧无可信来源 → 漏检计数 +1。
+    - decay:   连续漏检后向画面中心衰减, 避免冻结在陈旧位置。
+    reliable 由 find_targets 每帧末尾按本帧结果显式赋值 (名牌命中 或 v13 兜底 = 可信)。
+    """
+
+    x: int
+    y: int
+    reliable: bool = False        # 本帧位置是否来自可信来源 (名牌/v13), 决定脱困跳是否可信
+    pending: tuple | None = None  # 大位移候选 (等两帧确认)
+    miss_frames: int = 0          # 连续漏检帧 (用于位置衰减)
+
+    def confirm(self, x: int, y: int) -> None:
+        """确认位置: 更新坐标, 重置候选与漏检。"""
+        self.x, self.y = int(x), int(y)
+        self.pending = None
+        self.miss_frames = 0
+
+    def propose(self, x: int, y: int) -> None:
+        """大位移候选第一帧: 挂起等下一帧同位置确认。"""
+        self.pending = (int(x), int(y))
+
+    def reject(self) -> None:
+        """本帧无可信来源: 漏检计数 +1。"""
+        self.miss_frames += 1
+
+    def decay(self, center: tuple, step: int) -> None:
+        """向画面中心衰减一步 (连续漏检时避免冻结在陈旧位置)。"""
+        dx, dy = center[0] - self.x, center[1] - self.y
+        dist = math.hypot(dx, dy)
+        if dist > step:
+            s = step / dist
+            self.x = int(round(self.x + dx * s))
+            self.y = int(round(self.y + dy * s))
+
+
 class MonsterTracker:
     """维护怪物的身份与生命周期。
 

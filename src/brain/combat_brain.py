@@ -30,7 +30,7 @@ from src.capture.window_capture import WindowCapture
 from src.brain.game_controller import GameController, Direction
 from src.brain.patrol_mover import PatrolMover
 from src.brain.action_executor import ActionExecutor
-from src.brain.entity_tracker import MonsterTracker
+from src.brain.entity_tracker import MonsterTracker, PlayerState
 from src.perception.hp_monitor import HPMonitor
 from src.brain.data_collector import DataCollector
 from src.perception.nametag_hsv_locator import NametagHSVLocator, NAMETAG_SCORE_OK_THRESHOLD as NAMETAG_MATCH_THRESHOLD
@@ -164,7 +164,6 @@ class CombatBrain:
         }
         self._v13_fallback_first_log = True  # v13 Player 兜底首次接管时打一次日志
         self._prev_gray = None               # 帧间运动检测用上一帧灰度
-        self._player_reliable = False  # 本帧玩家位置是否来自可信来源 (名牌/v13), 决定脱困跳是否可信
         self._running = False
         self.state = BrainState.STANDBY
         self.kill_count = 0
@@ -173,8 +172,9 @@ class CombatBrain:
         # 移动: PatrolMover (打→接近→巡逻 三层)
         self.mover = PatrolMover()
 
-        # 实体层: 怪物身份与生命周期 (跨帧存活, 替换像素距离 hack)
+        # 实体层: 怪物身份与生命周期 + 玩家实体 (跨帧存活)
         self.monster_tracker = MonsterTracker()
+        self.player = PlayerState(x=PLAYER_X, y=PLAYER_Y)
 
         # 眼手分离: 主循环决策 → 动作执行器 (独立线程) 执行按键
         self.controller = None        # run() 时注入
@@ -183,11 +183,6 @@ class CombatBrain:
         # 兜底定时器节流时间戳
         self._last_hp_potion_time = time.time()  # HP 药水兜底节流时间戳
         self._last_pet_feed_time = time.time()   # 喂宠物节流时间戳
-
-        # 玩家位置视觉惯性缓存
-        self._cached_player_pos = (PLAYER_X, PLAYER_Y)
-        self._player_miss_frames = 0  # 玩家连续漏检帧计数 (用于位置衰减)
-        self._player_pending = None   # 名牌大位移候选 (等两帧确认, 防锁到其它玩家名牌)
 
         # ── 感知加固: 名牌 HSV 定位器 (无模板, 多人场景选最靠下) ──
         self.nametag_locator = NametagHSVLocator()
@@ -257,7 +252,7 @@ class CombatBrain:
         """双模型感知: 玩家位置名牌锚定(v13 Player 兜底), 怪由 v19 检测,
         地形(平台/梯子)由 v13 提供。返回 (targets, px, py, raw_results, platforms, ropes)。
         run_terrain=False: 跳过地形模型 (错帧), 用缓存的地形结果。"""
-        player_x, player_y = self._cached_player_pos
+        player = self.player
         raw_results = None
         platforms = []     # (y, x_left, x_right) 行走面
         ropes = []         # (x, y_top, y_bottom) 攀爬
@@ -269,30 +264,21 @@ class CombatBrain:
         matched = False
         pending = False
         if self.nametag_locator.available:
-            npx, npy, nscore, nok = self.nametag_locator.locate(frame, self._cached_player_pos)
+            npx, npy, nscore, nok = self.nametag_locator.locate(frame, (player.x, player.y))
             if nok:
-                dist_c = math.hypot(npx - player_x, npy - player_y)
+                dist_c = math.hypot(npx - player.x, npy - player.y)
                 if dist_c > PLAYER_MAX_MOVE_PX:
                     pass  # 瞬移太远 → 拒绝 (本轮视为无匹配)
                 elif dist_c <= PLAYER_COMMIT_DIST:
-                    # 小位移 → 直接确认 (正常走动/静止)
-                    player_x, player_y = int(npx), int(npy)
-                    self._cached_player_pos = (player_x, player_y)
-                    self._player_pending = None
-                    self._player_miss_frames = 0
+                    player.confirm(npx, npy)   # 小位移直接确认 (正常走动/静止)
                     matched = True
                 elif nscore <= NAMETAG_CONFIDENT_SCORE:
-                    # 大位移 + 得分可信 → 两帧连续同位置才确认 (玩家确实走到了这里)
-                    if (self._player_pending is not None
-                            and math.hypot(npx - self._player_pending[0], npy - self._player_pending[1]) <= PLAYER_CONTINUITY_DIST):
-                        player_x, player_y = int(npx), int(npy)
-                        self._cached_player_pos = (player_x, player_y)
-                        self._player_pending = None
-                        self._player_miss_frames = 0
+                    if (player.pending is not None
+                            and math.hypot(npx - player.pending[0], npy - player.pending[1]) <= PLAYER_CONTINUITY_DIST):
+                        player.confirm(npx, npy)   # 大位移两帧同位置 → 确认 (玩家确实走到了这里)
                         matched = True
                     else:
-                        # 第一帧 → 进入候选, 等下一帧确认
-                        self._player_pending = (int(npx), int(npy))
+                        player.propose(npx, npy)   # 第一帧挂起, 等下一帧确认
                         pending = True
                 else:
                     # 大位移但得分平庸 → 很可能是其它玩家的名牌, 不锁它 (走漏检衰减兜底)
@@ -333,36 +319,26 @@ class CombatBrain:
         used_v13 = False
         if not matched and not pending:
             if player_cand is not None:
-                dist_c = math.hypot(player_cand[0] - player_x, player_cand[1] - player_y)
+                dist_c = math.hypot(player_cand[0] - player.x, player_cand[1] - player.y)
                 if dist_c <= PLAYER_MAX_MOVE_PX:
-                    player_x, player_y = player_cand
-                    self._cached_player_pos = player_cand
-                    self._player_miss_frames = 0
-                    self._player_pending = None
+                    player.confirm(*player_cand)
                     used_v13 = True
                     if self._v13_fallback_first_log:
                         log.info("[PLAYER] 名牌 miss, 使用 v13 Player 兜底")
                         self._v13_fallback_first_log = False
             if not used_v13:
                 # 连续漏检 → 缓慢向画面中心衰减, 避免冻结在陈旧位置
-                self._player_miss_frames += 1
-                if self._player_miss_frames == PLAYER_MISS_DECAY_FRAMES:
+                player.reject()
+                if player.miss_frames == PLAYER_MISS_DECAY_FRAMES:
                     log.info("[PLAYER] 名牌连续漏检, 玩家位置开始向画面中心衰减")
-                if self._player_miss_frames >= PLAYER_MISS_DECAY_FRAMES:
+                if player.miss_frames >= PLAYER_MISS_DECAY_FRAMES:
                     h, w = frame.shape[:2]
-                    center = (w // 2, int(h * 0.58))
-                    dx, dy = center[0] - player_x, center[1] - player_y
-                    dist = math.hypot(dx, dy)
-                    if dist > PLAYER_MISS_DECAY_STEP:
-                        step = PLAYER_MISS_DECAY_STEP / dist
-                        self._cached_player_pos = (
-                            int(round(player_x + dx * step)),
-                            int(round(player_y + dy * step))
-                        )
-                    player_x, player_y = self._cached_player_pos
+                    player.decay((w // 2, int(h * 0.58)), PLAYER_MISS_DECAY_STEP)
 
         # 玩家位置可信度: 名牌命中 或 v13 兜底 → 可信; 中心猜测/衰减 → 不可信 (移动层据此关掉假脱困跳)
-        self._player_reliable = matched or used_v13
+        player.reliable = matched or used_v13
+
+        player_x, player_y = player.x, player.y
 
         # 玩家排除区域 (名牌锚定): v19 常把玩家自己误检成 Monster, 用重叠面积过滤
         player_excl = (player_x - 45, player_y - 60, player_x + 45, player_y + 60)
@@ -493,7 +469,7 @@ class CombatBrain:
     def player_reliable(self) -> bool:
         """本帧玩家位置是否可信 (名牌/v13 命中)。不可信时移动层应关闭脱困跳, 避免假卡顿乱跳。"""
         with self._vision_lock:
-            return self._player_reliable
+            return self.player.reliable
 
     def _attack(self, controller: GameController, target: Target, px: int, py: int,
                 cancel=None) -> int:
