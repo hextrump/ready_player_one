@@ -46,6 +46,7 @@ PLAYER_X = 800
 PLAYER_Y = 520
 
 # ===== 玩家定位参数 (名牌定位器为主, 此处为合理性门控与漏检衰减) =====
+PLAYER_BODY_RADIUS = 45       # 玩家身体半径: 怪框中心贴近任一"其他玩家身体" → 那是玩家, 滤掉
 PLAYER_MAX_MOVE_PX = 260.0    # 名牌结果距上一位置的最大可信位移 (防误匹配远处其它玩家)
 PLAYER_COMMIT_DIST = 40.0     # 距已确认位置 ≤40px → 直接提交 (正常走动/微移)
 PLAYER_CONTINUITY_DIST = 80.0 # 大位移需两帧连续; 走动时每帧约 35px, 80 足够跟上又过滤瞬移
@@ -327,6 +328,14 @@ class CombatBrain:
         # 玩家排除区域 (名牌锚定): v19 常把玩家自己误检成 Monster, 用重叠面积过滤
         player_excl = (player_x - 45, player_y - 60, player_x + 45, player_y + 60)
 
+        # 其他玩家身体位置 (本帧所有名牌候选下方): 排除主角自己 (主角附近的猪是正当目标)
+        # 用于滤掉被 v19 误检成怪的"其他玩家"
+        player_bodies = []
+        if self.nametag_locator.available:
+            for bx, by in self.nametag_locator.locate_all():
+                if math.hypot(bx - player_x, by - player_y) > PLAYER_BODY_RADIUS * 1.5:
+                    player_bodies.append((bx, by))
+
         # ── 怪物检测: v19 专用单类 Monster (猪训练, 召回高) ──
         targets = []
         if self.monster_model:
@@ -353,6 +362,10 @@ class CombatBrain:
                 inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
                 if inter > 0.3 * (w * h):
                     continue
+                # 名牌过滤: 怪框中心贴近其他玩家身体 → 那是玩家, 不是怪 (人有名牌, 猪没有)
+                if player_bodies:
+                    if any(math.hypot(cx - bx, cy - by) <= PLAYER_BODY_RADIUS for bx, by in player_bodies):
+                        continue
 
                 targets.append(Target(
                     name=name, cx=cx, cy=cy, w=w, h=h,

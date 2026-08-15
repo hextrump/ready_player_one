@@ -80,6 +80,7 @@ class NametagHSVLocator:
         self.last_match_rect = None  # (x, y, w, h)
         self.last_player_pos = None  # (px, py)
         self.last_score = SCORE_MISS
+        self._last_candidates = []  # 本帧所有名牌候选 [(bottom_y, x, y, w, h)], 供 locate_all 复用
 
     def locate(self, frame_bgr: np.ndarray, last_player_pos=(0, 0)) -> tuple:
         """
@@ -136,9 +137,12 @@ class NametagHSVLocator:
             candidates.append((virtual_y + 20, nx, virtual_y, nw, 20))
 
         if not candidates:
+            self._last_candidates = []
             self.last_match_rect = None
             self.last_score = SCORE_MISS
             return (last_player_pos[0], last_player_pos[1], SCORE_MISS, False)
+
+        self._last_candidates = candidates  # 缓存全部候选, 供 locate_all 滤掉误检成怪的玩家
 
         # 取最靠下 (y 最大) = 主角
         candidates.sort(key=lambda t: -t[0])
@@ -151,3 +155,13 @@ class NametagHSVLocator:
         self.last_player_pos = (px, py)
         self.last_score = SCORE_OK
         return (px, py, SCORE_OK, True)
+
+    def locate_all(self) -> list:
+        """返回本帧所有玩家身体位置 (自 + 他人), 复用 locate 缓存的候选。
+
+        用于滤掉被 v19 误检成怪的玩家: 怪框中心若贴近任一玩家身体位置 → 那是玩家, 不是怪。
+        """
+        bodies = []
+        for _, x, y, w, h in self._last_candidates:
+            bodies.append((x + w // 2, y + h + HEAD_OFFSET_Y))
+        return bodies
