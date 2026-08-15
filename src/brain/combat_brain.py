@@ -30,7 +30,7 @@ from src.capture.window_capture import WindowCapture
 from src.brain.game_controller import GameController, Direction
 from src.brain.patrol_mover import PatrolMover
 from src.brain.action_executor import ActionExecutor
-from src.brain.entity_tracker import MonsterTracker, PlayerState
+from src.brain.entity_tracker import WorldState, MonsterTracker, PlayerState
 from src.perception.hp_monitor import HPMonitor
 from src.brain.data_collector import DataCollector
 from src.perception.nametag_hsv_locator import NametagHSVLocator, NAMETAG_SCORE_OK_THRESHOLD as NAMETAG_MATCH_THRESHOLD
@@ -151,17 +151,13 @@ class CombatBrain:
         # 定时心跳截图 (数据收集, 仅常规样本)
         self.data_collector = DataCollector()
 
-        # 多线程视觉缓存 (眼手分离)
+        # 多线程世界状态 (眼手分离): 感知线程更新 self.world, 决策线程只读它
         self._vision_lock = threading.Lock()
         self._latest_frame = None
-        self._latest_perception = {
-            "targets": [],
-            "player_x": PLAYER_X,
-            "player_y": PLAYER_Y,
-            "platforms": [],   # (y, x_left, x_right) 行走面
-            "ropes": [],       # (x, y_top, y_bottom) 攀爬
-            "fps": 0.0
-        }
+        self.world = WorldState(
+            player=PlayerState(x=PLAYER_X, y=PLAYER_Y),
+            monsters=MonsterTracker(),
+        )
         self._v13_fallback_first_log = True  # v13 Player 兜底首次接管时打一次日志
         self._prev_gray = None               # 帧间运动检测用上一帧灰度
         self._running = False
@@ -171,10 +167,6 @@ class CombatBrain:
 
         # 移动: PatrolMover (打→接近→巡逻 三层)
         self.mover = PatrolMover()
-
-        # 实体层: 怪物身份与生命周期 + 玩家实体 (跨帧存活)
-        self.monster_tracker = MonsterTracker()
-        self.player = PlayerState(x=PLAYER_X, y=PLAYER_Y)
 
         # 眼手分离: 主循环决策 → 动作执行器 (独立线程) 执行按键
         self.controller = None        # run() 时注入
@@ -206,13 +198,6 @@ class CombatBrain:
                 run_terrain = (self._frame_idx % TERRAIN_EVERY == 0)
                 targets, px, py, raw_results, platforms, ropes = self.find_targets(frame, run_terrain)
 
-                # 实体化: 给怪物稳定身份 (跨帧存活); 只暴露本帧观察到的实体给决策层
-                # (ghost 实体保留在 tracker 内维持身份, 不参与决策 → 不会去打空位)
-                targets = self.monster_tracker.update(targets)
-                targets = [t for t in targets if t.miss_frames == 0]
-                for t in targets:
-                    t.dist = math.hypot(t.cx - px, t.cy - py)
-
                 # 帧间运动量 (卡住检测): 玩家走动/相机滚动时画面一直变; 卡住时画面静止
                 gray_small = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 gray_small = cv2.resize(gray_small, (160, 90))
@@ -222,18 +207,17 @@ class CombatBrain:
                     motion = 1.0
                 self._prev_gray = gray_small
 
-                # 更新共享缓存
+                # 提交世界状态 (感知线程单写; 决策线程只读, 锁内一次提交)
                 with self._vision_lock:
                     self._latest_frame = frame.copy()
-                    self._latest_perception = {
-                        "targets": targets,
-                        "player_x": px,
-                        "player_y": py,
-                        "platforms": platforms,
-                        "ropes": ropes,
-                        "motion": motion,
-                        "fps": 1.0 / (time.time() - t0 + 0.001)
-                    }
+                    self.world.monsters.update(targets)
+                    w = self.world
+                    for t in w.targets:   # 只暴露本帧观察到的怪 (ghost 不参与决策, 不打空位)
+                        t.dist = math.hypot(t.cx - px, t.cy - py)
+                    w.platforms = platforms
+                    w.ropes = ropes
+                    w.motion = motion
+                    w.fps = 1.0 / (time.time() - t0 + 0.001)
 
                 # 定时心跳截图 (仅常规样本, 每 save_interval_seconds 秒一帧)
                 # 只挂机中采集; 按 F 停止 (active_hunting=False) 后不再自动截图
@@ -252,7 +236,7 @@ class CombatBrain:
         """双模型感知: 玩家位置名牌锚定(v13 Player 兜底), 怪由 v19 检测,
         地形(平台/梯子)由 v13 提供。返回 (targets, px, py, raw_results, platforms, ropes)。
         run_terrain=False: 跳过地形模型 (错帧), 用缓存的地形结果。"""
-        player = self.player
+        player = self.world.player
         raw_results = None
         platforms = []     # (y, x_left, x_right) 行走面
         ropes = []         # (x, y_top, y_bottom) 攀爬
@@ -417,12 +401,11 @@ class CombatBrain:
         return False
 
     def _any_target_in_range(self, buffer_x: int = 0) -> bool:
-        """读视觉缓存, 判断当前画面是否有任何怪进入攻击范围 (替换原 run() 内两处重复闭包)。"""
+        """读世界状态, 判断当前画面是否有任何怪进入攻击范围 (替换原 run() 内两处重复闭包)。"""
         with self._vision_lock:
-            perc = self._latest_perception
-            tgs = perc["targets"]
-            px = perc["player_x"]
-            py = perc["player_y"]
+            tgs = self.world.targets
+            px = self.world.player_x
+            py = self.world.player_y
         return any(self.is_in_attack_range(t, px, py, buffer_x=buffer_x) for t in tgs)
 
     # ---- PatrolMover 感知接口 (duck-typed) ----
@@ -432,17 +415,16 @@ class CombatBrain:
         return self._any_target_in_range(buffer_x=buffer_x)
 
     def player_pos(self) -> tuple:
-        """当前玩家位置。"""
+        """当前玩家位置 (世界状态)。"""
         with self._vision_lock:
-            return (self._latest_perception["player_x"], self._latest_perception["player_y"])
+            return (self.world.player_x, self.world.player_y)
 
     def nearest_target(self) -> Optional[Target]:
         """最近怪 (巡逻方向偏置用)。"""
         with self._vision_lock:
-            perc = self._latest_perception
-            tgs = perc["targets"]
-            px = perc["player_x"]
-            py = perc["player_y"]
+            tgs = self.world.targets
+            px = self.world.player_x
+            py = self.world.player_y
         if not tgs:
             return None
         return min(tgs, key=lambda t: math.hypot(t.cx - px, t.cy - py))
@@ -450,10 +432,9 @@ class CombatBrain:
     def any_target_near(self, dist: float = 220.0) -> bool:
         """附近 dist 像素内是否有怪 (巡逻时判断要不要普攻, 避免空挥)。"""
         with self._vision_lock:
-            perc = self._latest_perception
-            tgs = perc["targets"]
-            px = perc["player_x"]
-            py = perc["player_y"]
+            tgs = self.world.targets
+            px = self.world.player_x
+            py = self.world.player_y
         for t in tgs:
             if math.hypot(t.cx - px, t.cy - py) <= dist:
                 return True
@@ -463,13 +444,13 @@ class CombatBrain:
         """画面是否在变化 (玩家走动/相机滚动/怪移动)。卡在边缘时画面静止 → False。
         threshold 对应 src/brain/patrol_mover.MOTION_MOVING_THRESHOLD, 调低=更易判卡住。"""
         with self._vision_lock:
-            m = self._latest_perception.get("motion", 1.0)
+            m = self.world.motion
         return m > threshold
 
     def player_reliable(self) -> bool:
         """本帧玩家位置是否可信 (名牌/v13 命中)。不可信时移动层应关闭脱困跳, 避免假卡顿乱跳。"""
         with self._vision_lock:
-            return self.player.reliable
+            return self.world.player.reliable
 
     def _attack(self, controller: GameController, target: Target, px: int, py: int,
                 cancel=None) -> int:
@@ -505,14 +486,13 @@ class CombatBrain:
                         log.info(f"[ATTACK] 决策变更,中止 burst (共 {hit_count} 下)")
                         break
 
-                    # 每 BURST_RECHECK 重新从视觉线程拉最新目标,死了就走
+                    # 每 BURST_RECHECK 重新从世界状态拉最新目标,死了就走
                     if now - last_check_t >= BURST_RECHECK:
                         last_check_t = now
                         with self._vision_lock:
-                            cur = self._latest_perception
-                            cur_tgs = cur["targets"]
-                            cur_px = cur["player_x"]
-                            cur_py = cur["player_y"]
+                            cur_tgs = self.world.targets
+                            cur_px = self.world.player_x
+                            cur_py = self.world.player_y
                         target_alive = False
                         for t in cur_tgs:
                             if self.is_in_attack_range(t, cur_px, cur_py):
@@ -550,11 +530,12 @@ class CombatBrain:
         log.info(f"[ATTACK] {target.name} × {hit_count} 击 @ ({target.cx},{target.cy})")
         return hit_count
 
-    def _decide(self, perc: dict) -> tuple:
-        """三层优先决策 (不执行动作, 只返回命令): 打 → 接近(直接可及) → 地形巡逻。"""
-        targets = perc["targets"]
-        px, py = perc["player_x"], perc["player_y"]
-        platforms = perc.get("platforms", [])
+    def _decide(self) -> tuple:
+        """三层优先决策 (只读世界状态, 不执行动作): 打 → 接近(直接可及) → 地形巡逻。"""
+        with self._vision_lock:
+            targets = self.world.targets
+            px, py = self.world.player_x, self.world.player_y
+            platforms = list(self.world.platforms)
         if not self.active_hunting:
             self.state = BrainState.STANDBY
             return ("none", None)
@@ -576,12 +557,11 @@ class CombatBrain:
         if controller is None:
             return
         cancel = lambda: self.executor.is_cancelled(action_id)
-        # 动作开始时读最新感知 (动作内部如需最新数据会自行再读)
+        # 动作开始时读世界状态 (动作内部如需最新数据会自行再读)
         with self._vision_lock:
-            perc = self._latest_perception
-            px, py = perc.get("player_x", PLAYER_X), perc.get("player_y", PLAYER_Y)
-            platforms = perc.get("platforms", [])
-            ropes = perc.get("ropes", [])
+            px, py = self.world.player_x, self.world.player_y
+            platforms = list(self.world.platforms)
+            ropes = list(self.world.ropes)
         try:
             if atype == "attack" and payload is not None:
                 self._attack(controller, payload, px, py, cancel)
@@ -616,17 +596,15 @@ class CombatBrain:
             t0 = time.time() # 用于画面 FPS 显示统计
             loop_fps = 1.0 / max(0.001, t0 - last_loop_t)  # 完整循环周期 (含 sleep) → ~10fps
             last_loop_t = t0
-            # 获取最新感知数据 (不阻塞)
+            # 获取最新世界状态 (不阻塞)
             with self._vision_lock:
-                perc = self._latest_perception.copy()
+                targets = self.world.targets
+                px, py = self.world.player_x, self.world.player_y
                 frame = self._latest_frame.copy() if self._latest_frame is not None else None
 
             if frame is None:
                 time.sleep(0.1)
                 continue
-
-            targets = perc["targets"]
-            px, py = perc["player_x"], perc["player_y"]
 
             # ===== 兜底 HP 药水: 每 10 分钟主动按一次 a (防止 auto_healer 漏触发) =====
             if self.active_hunting and time.time() - self._last_hp_potion_time >= HP_POTION_INTERVAL:
@@ -641,7 +619,7 @@ class CombatBrain:
                 self._last_pet_feed_time = time.time()
 
             # 决策 → 推送动作 (ActionExecutor 内部按粗网格键去重, 动作不重复执行不被打断)
-            action = self._decide(perc)
+            action = self._decide()
             self.executor.set_action(action)
 
             # 渲染可视化界面 (每帧, 不再被动作阻塞)
@@ -684,10 +662,10 @@ class CombatBrain:
             cv2.putText(vis_frame, f"{t.name} {t.dist:.0f}px", (tx1, ty1 - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # 绘制地形 (平台橙条 / 梯子黄条, 来自 v13)
+        # 绘制地形 (平台橙条 / 梯子黄条, 来自世界状态)
         with self._vision_lock:
-            plat = self._latest_perception.get("platforms", [])
-            rope = self._latest_perception.get("ropes", [])
+            plat = self.world.platforms
+            rope = self.world.ropes
         for p in plat:
             cv2.rectangle(vis_frame, (p[1], p[0] - 3), (p[2], p[0] + 3), (0, 165, 255), -1)
         for r in rope:

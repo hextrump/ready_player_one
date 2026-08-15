@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List
 
 
@@ -76,6 +76,35 @@ class PlayerState:
             s = step / dist
             self.x = int(round(self.x + dx * s))
             self.y = int(round(self.y + dy * s))
+
+
+@dataclass
+class WorldState:
+    """统一世界状态: 玩家实体 + 怪实体 + 地形, 跨帧存活 (世界树的地基)。
+
+    感知线程每帧更新, 决策线程只读它 (不再读裸 dict 上下文)。
+    targets/player_x/player_y 是给决策层的投影: ghost 怪不参与, 只暴露本帧观察到的。
+    """
+
+    player: PlayerState
+    monsters: MonsterTracker
+    platforms: list = field(default_factory=list)   # (y, x_left, x_right) 行走面
+    ropes: list = field(default_factory=list)       # (x, y_top, y_bottom) 攀爬
+    motion: float = 0.0                             # 帧间运动量 (卡住检测)
+    fps: float = 0.0                                # 感知线程帧率
+
+    @property
+    def targets(self) -> List[Monster]:
+        """本帧观察到的怪 (决策消费; ghost 实体不参与决策)。"""
+        return [m for m in self.monsters.monsters if m.miss_frames == 0]
+
+    @property
+    def player_x(self) -> int:
+        return self.player.x
+
+    @property
+    def player_y(self) -> int:
+        return self.player.y
 
 
 class MonsterTracker:
