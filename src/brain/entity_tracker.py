@@ -18,6 +18,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List
 
+# 决策层认怪的最低连续观察帧数: 真实怪连续存在 → 第 2 帧起可打;
+# 偶尔误检 (宠物/玩家/掉落闪一帧) 断档归零 → 永远达不到, 被滤掉。
+MIN_SEEN_FRAMES = 2
+
 
 @dataclass
 class Monster:
@@ -30,7 +34,7 @@ class Monster:
     h: int
     conf: float
     dist: float = 0.0      # 与玩家的距离 (感知循环每帧重算)
-    seen_frames: int = 1   # 连续被观察帧数
+    seen_frames: int = 1   # 连续被观察帧数 (断档归零; 防偶尔误检如宠物/玩家/掉落)
     miss_frames: int = 0   # 连续未观察帧数
     last_seen: float = 0.0 # 最近一次被观察到的时间
 
@@ -95,8 +99,9 @@ class WorldState:
 
     @property
     def targets(self) -> List[Monster]:
-        """本帧观察到的怪 (决策消费; ghost 实体不参与决策)。"""
-        return [m for m in self.monsters.monsters if m.miss_frames == 0]
+        """本帧观察到的怪且连续确认 (决策消费; ghost/未连续确认不参与决策, 滤掉偶尔误检)。"""
+        return [m for m in self.monsters.monsters
+                if m.miss_frames == 0 and m.seen_frames >= MIN_SEEN_FRAMES]
 
     @property
     def player_x(self) -> int:
@@ -172,10 +177,11 @@ class MonsterTracker:
                 self._next_id += 1
                 used.add(ent.id)
 
-        # 2. 老化: 未被匹配的实体 miss_frames++, 超过 DESPAWN_AFTER 未观察则销毁
+        # 2. 老化: 未被匹配的实体 miss_frames++, 连续观察计数归零, 超过 DESPAWN_AFTER 未观察则销毁
         for eid, ent in list(self._entities.items()):
             if eid not in used:
                 ent.miss_frames += 1
+                ent.seen_frames = 0  # 断档 → 连续观察归零 (偶尔误检永远达不到确认门槛)
                 if now - ent.last_seen > self.DESPAWN_AFTER:
                     del self._entities[eid]
 
