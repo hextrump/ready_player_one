@@ -43,8 +43,9 @@ NAME_GAP_MIN, NAME_GAP_MAX = 5, 30
 X_OFFSET_MAX = 30
 WIDTH_TOLERANCE = 50
 
-# 名牌 → 角色中心的偏移 (实测: 名牌在头顶偏上方, 角色在名牌下方约 30px)
-HEAD_OFFSET_Y = 30
+# 名牌 → 玩家脚底的关系 (实测: 名牌挂在角色脚底下方, 脚底正好在名牌上侧边缘)
+# 玩家中心 = 名牌顶部 - FEET_TO_CENTER (中心在脚底上方 ~35px, 与 patrol_mover.PLAYER_FOOT_OFFSET 一致)
+FEET_TO_CENTER = 35
 
 # 占位 score (模板匹配的 0.0~0.1 越低越好, 这里返回 0.05 表示命中, 1.0 表示未命中)
 SCORE_OK = 0.05
@@ -149,9 +150,9 @@ class NametagHSVLocator:
         _, x, y, w, h = candidates[0]
         self.last_match_rect = (x, y, w, h)
 
-        # 角色中心 = 徽章底部中点 + (0, HEAD_OFFSET_Y)
+        # 名牌顶部 = 玩家脚底 (脚站地上, 名牌挂在脚底下方); 角色中心 = 脚底上方 FEET_TO_CENTER
         px = x + w // 2
-        py = y + h + HEAD_OFFSET_Y
+        py = y - FEET_TO_CENTER
         self.last_player_pos = (px, py)
         self.last_score = SCORE_OK
         return (px, py, SCORE_OK, True)
@@ -163,5 +164,5 @@ class NametagHSVLocator:
         """
         bodies = []
         for _, x, y, w, h in self._last_candidates:
-            bodies.append((x + w // 2, y + h + HEAD_OFFSET_Y))
+            bodies.append((x + w // 2, y - FEET_TO_CENTER))
         return bodies

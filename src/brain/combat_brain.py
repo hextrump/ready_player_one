@@ -733,7 +733,7 @@ class CombatBrain:
 
     def _handle_vision_key(self, key: Optional[int]) -> None:
         """HSV 版本无 offset 调节 (无模板依赖), 此方法留空避免战斗中误改。"""
-        # 模板匹配版的快捷键已废弃 (改用 HSV 检测, 偏移硬编码在 HEAD_OFFSET_Y)
+        # 玩家位置由 HSV 名牌定位器按"名牌顶部=脚底"计算 (见 nametag_hsv_locator)
         return
 
     def stop(self):
