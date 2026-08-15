@@ -30,7 +30,7 @@ from src.capture.window_capture import WindowCapture
 from src.brain.game_controller import GameController, Direction
 from src.brain.patrol_mover import PatrolMover
 from src.brain.action_executor import ActionExecutor
-from src.brain.entity_tracker import WorldState, MonsterTracker, PlayerState
+from src.brain.entity_tracker import WorldState, MonsterTracker, PlayerState, TerrainTracker
 from src.perception.hp_monitor import HPMonitor
 from src.brain.data_collector import DataCollector
 from src.perception.nametag_hsv_locator import NametagHSVLocator, NAMETAG_SCORE_OK_THRESHOLD as NAMETAG_MATCH_THRESHOLD
@@ -144,9 +144,8 @@ class CombatBrain:
         except Exception as e:
             log.error(f"地形模型加载失败: {e}")
 
-        # 地形结果缓存 (错帧跳过时复用, 平台/梯子基本不动)
-        self._cached_platforms = []
-        self._cached_ropes = []
+        # 地形持久化: 平台/梯子跨帧融合成状态 (身份+去抖+滤误检), 替换 3 帧缓存
+        self.terrain_tracker = TerrainTracker()
         self._frame_idx = 0  # 感知帧计数 (地形错帧用)
 
         # 定时心跳截图 (数据收集, 仅常规样本)
@@ -212,11 +211,12 @@ class CombatBrain:
                 with self._vision_lock:
                     self._latest_frame = frame.copy()
                     self.world.monsters.update(targets)
+                    self.terrain_tracker.update(platforms, ropes)   # 地形跨帧融合
                     w = self.world
                     for t in w.targets:   # 只暴露本帧观察到的怪 (ghost 不参与决策, 不打空位)
                         t.dist = math.hypot(t.cx - px, t.cy - py)
-                    w.platforms = platforms
-                    w.ropes = ropes
+                    w.platforms = self.terrain_tracker.platforms
+                    w.ropes = self.terrain_tracker.ropes
                     w.motion = motion
                     w.fps = 1.0 / (time.time() - t0 + 0.001)
 
@@ -293,12 +293,7 @@ class CombatBrain:
                         continue
                     dedup.append(r)
                 ropes = dedup
-                self._cached_platforms = platforms
-                self._cached_ropes = ropes
-            else:
-                # 错帧: 复用上次地形结果 (平台/梯子基本不动, 0.3s 内足够移动用)
-                platforms = self._cached_platforms
-                ropes = self._cached_ropes
+            # 错帧时 platforms/ropes 保持空, 持久地形由 terrain_tracker 跨帧融合提供
 
         # ── 玩家位置: 名牌 miss → v13 Player 兜底 → 画面中心衰减 ──
         used_v13 = False

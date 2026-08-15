@@ -187,3 +187,146 @@ class MonsterTracker:
 
         # 3. 返回存活实体 (顺序稳定)
         return self.monsters
+
+
+@dataclass
+class PlatformEntity:
+    """有身份的持久平台实体 (跨帧融合)。"""
+    id: int
+    y: int
+    x_left: int
+    x_right: int
+    seen_frames: int = 1
+    miss_frames: int = 0
+    last_seen: float = 0.0
+
+
+@dataclass
+class RopeEntity:
+    """有身份的持久梯子实体 (跨帧融合)。"""
+    id: int
+    x: int
+    y_top: int
+    y_bottom: int
+    seen_frames: int = 1
+    miss_frames: int = 0
+    last_seen: float = 0.0
+
+
+class TerrainTracker:
+    """地形持久化: 平台/梯子从"每帧观察"升格为"跨帧状态" (身份 + 融合 + 去抖)。
+
+    设计思想对齐: 地形也要像玩家/怪一样"收敛为系统状态", 而不是每帧重新发明。
+    - 融合: 匹配到的实体用加权平均平滑 (y + x 范围), 抗抖动/漂移
+    - 确认: 连续观察 >= MIN_SEEN_FRAMES 才暴露 (滤掉单帧误检的地形)
+    - 生命周期: 长时间没观察到销毁 (相机移动时旧平台让位重建)
+    """
+
+    MATCH_Y_TOL = 30      # 平台 y 容差 (与 patrol_mover.SURFACE_TOL_Y 一致)
+    MATCH_X_GAP = 25      # x 范围相邻/重叠判同一块
+    BLEND = 0.7           # 融合权重: 70% 旧 + 30% 新
+    MIN_SEEN_FRAMES = 2   # 连续观察门槛 (滤单帧误检)
+    DESPAWN_AFTER = 2.0   # 多久没观察销毁 (秒)
+
+    def __init__(self):
+        self._platforms: Dict[int, PlatformEntity] = {}
+        self._ropes: Dict[int, RopeEntity] = {}
+        self._next_pid = 1
+        self._next_rid = 1
+
+    @property
+    def platforms(self) -> List[tuple]:
+        """当前平台 [(y, x_left, x_right)] (与 PatrolMover 兼容)。"""
+        return [(p.y, p.x_left, p.x_right)
+                for p in sorted(self._platforms.values(), key=lambda p: p.id)
+                if p.seen_frames >= self.MIN_SEEN_FRAMES]
+
+    @property
+    def ropes(self) -> List[tuple]:
+        """当前梯子 [(x, y_top, y_bottom)]。"""
+        return [(r.x, r.y_top, r.y_bottom)
+                for r in sorted(self._ropes.values(), key=lambda r: r.id)
+                if r.seen_frames >= self.MIN_SEEN_FRAMES]
+
+    def reset(self) -> None:
+        self._platforms.clear()
+        self._ropes.clear()
+
+    def update(self, platforms: list, ropes: list, now: float | None = None) -> None:
+        """融合平台/梯子观察: 匹配→加权平滑; 未匹配→老化; 超时→销毁。"""
+        now = time.time() if now is None else now
+
+        # ── 平台融合 ──
+        used_p = set()
+        for (y, xl, xr) in platforms:
+            pid = self._match_platform(y, xl, xr, used_p)
+            if pid is not None:
+                p = self._platforms[pid]
+                b = self.BLEND
+                p.y = round(p.y * b + y * (1 - b))
+                p.x_left = round(p.x_left * b + xl * (1 - b))
+                p.x_right = round(p.x_right * b + xr * (1 - b))
+                p.seen_frames += 1
+                p.miss_frames = 0
+                p.last_seen = now
+                used_p.add(pid)
+            else:
+                pid = self._next_pid
+                self._next_pid += 1
+                self._platforms[pid] = PlatformEntity(id=pid, y=y, x_left=xl, x_right=xr, last_seen=now)
+                used_p.add(pid)
+        for pid, p in list(self._platforms.items()):
+            if pid not in used_p:
+                p.miss_frames += 1
+                # 不重置 seen_frames: 地形错帧(每 TERRAIN_EVERY 帧跑一次)的间隔帧不是"平台消失",
+                # 重置会导致真平台永远达不到确认门槛
+                if now - p.last_seen > self.DESPAWN_AFTER:
+                    del self._platforms[pid]
+
+        # ── 梯子融合 ──
+        used_r = set()
+        for (x, yt, yb) in ropes:
+            rid = self._match_rope(x, used_r)
+            if rid is not None:
+                r = self._ropes[rid]
+                b = self.BLEND
+                r.x = round(r.x * b + x * (1 - b))
+                r.y_top = round(r.y_top * b + yt * (1 - b))
+                r.y_bottom = round(r.y_bottom * b + yb * (1 - b))
+                r.seen_frames += 1
+                r.miss_frames = 0
+                r.last_seen = now
+                used_r.add(rid)
+            else:
+                rid = self._next_rid
+                self._next_rid += 1
+                self._ropes[rid] = RopeEntity(id=rid, x=x, y_top=yt, y_bottom=yb, last_seen=now)
+                used_r.add(rid)
+        for rid, r in list(self._ropes.items()):
+            if rid not in used_r:
+                r.miss_frames += 1
+                # 同平台: 不重置 seen_frames (错帧间隔不算平台消失)
+                if now - r.last_seen > self.DESPAWN_AFTER:
+                    del self._ropes[rid]
+
+    def _match_platform(self, y, xl, xr, used_p):
+        """找与检测 (y, xl, xr) 同一条平台的实体 (y 相近 + x 范围相邻/重叠)。"""
+        for pid, p in self._platforms.items():
+            if pid in used_p:
+                continue
+            if abs(p.y - y) > self.MATCH_Y_TOL:
+                continue
+            if p.x_right < xl - self.MATCH_X_GAP or p.x_left > xr + self.MATCH_X_GAP:
+                continue
+            return pid
+        return None
+
+    def _match_rope(self, x, used_r):
+        """找与检测 x 同一条梯子的实体。"""
+        for rid, r in self._ropes.items():
+            if rid in used_r:
+                continue
+            if abs(r.x - x) > self.MATCH_X_GAP:
+                continue
+            return rid
+        return None
