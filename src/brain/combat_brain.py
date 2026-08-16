@@ -492,9 +492,21 @@ class CombatBrain:
                 while time.time() - start_t < BURST_TIMEOUT:
                     now = time.time()
 
-                    # 决策已变更 (新目标/换行动) → 中止当前 burst
+                    # 决策已变更 → 中止 burst。区分"目标死了"(正常) vs"真抖动换目标"(问题):
+                    # 目标已死 = 决策自然前进, 不算异常 (看门狗不报); 真抖动才报。
                     if cancel and cancel():
-                        log.info(f"[ATTACK] 决策变更,中止 burst (共 {hit_count} 下)")
+                        alive = False
+                        with self._vision_lock:
+                            for t in self.world.targets:
+                                if (target_id is not None and getattr(t, "id", None) == target_id) or (
+                                        target_id is None
+                                        and abs(t.cx - target_lock[0]) < 100 and abs(t.cy - target_lock[1]) < 80):
+                                    alive = True
+                                    break
+                        if alive:
+                            log.info(f"[ATTACK] 决策变更,中止 burst (共 {hit_count} 下)")
+                        else:
+                            log.info(f"[ATTACK] 目标已死/消失,提前结束 (共 {hit_count} 下)")
                         break
 
                     # 每 BURST_RECHECK 重新从世界状态拉最新目标,死了就走

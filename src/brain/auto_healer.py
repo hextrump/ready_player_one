@@ -81,6 +81,11 @@ class AutoHealer:
                     continue
 
                 frame = self.wc.grab()
+                # 周期重校准 (每 ~30s): 启动时校准的 bbox 可能陈旧 (游戏状态变/条移位),
+                # 陈旧 bbox 会绕过灰条兜底读到错误值 (如 0%), 周期重校可修正
+                self._loop_count = getattr(self, '_loop_count', 0) + 1
+                if self._loop_count % 75 == 0:
+                    self.hp_monitor.calibrate(frame)
                 vitals = self.hp_monitor.read(frame)
 
                 # 检查 HP
