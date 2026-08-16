@@ -46,6 +46,7 @@ def main() -> int:
         pos = LOG.stat().st_size
     last_fire: dict[str, float] = {}
     last_attack_t: float | None = None
+    last_activity_t = time.time()   # 日志最近写入时间 (判断 bot 是否在跑)
     now = time.time()
 
     while True:
@@ -63,6 +64,7 @@ def main() -> int:
                     pos = f.tell()
                 now = time.time()
                 for line in new.splitlines():
+                    last_activity_t = now
                     if ATTACK_RE.search(line):
                         last_attack_t = now
                     for name, pat in PATTERNS:
@@ -71,11 +73,12 @@ def main() -> int:
                                 last_fire[name] = now
                                 emit(f"{name}: {line.strip()}")
 
-            # 无进展: 之前击杀过, 但连续 NO_PROGRESS_MIN 分钟没击杀
-            if last_attack_t is not None and now - last_attack_t > NO_PROGRESS_MIN * 60:
+            # 无进展: 只在 bot 还在跑 (日志近期活跃) 时判定; bot 停了 (日志不写) 不报
+            bot_alive = now - last_activity_t < 60
+            if bot_alive and last_attack_t is not None and now - last_attack_t > NO_PROGRESS_MIN * 60:
                 if now - last_fire.get("NO_PROGRESS", 0) > PATTERN_COOLDOWN:
                     last_fire["NO_PROGRESS"] = now
-                    emit(f"NO_PROGRESS: {int((now - last_attack_t) / 60)} 分钟无击杀")
+                    emit(f"NO_PROGRESS: {int((now - last_attack_t) / 60)} 分钟无击杀 (bot 在跑但没进展)")
             time.sleep(POLL)
         except Exception:
             time.sleep(POLL * 2)
