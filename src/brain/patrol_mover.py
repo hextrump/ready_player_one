@@ -67,6 +67,8 @@ class PatrolMover:
         self._jump_count = {}               # 目标粗网格key -> 连续登台跳次数
         self._blocked = {}                  # 目标粗网格key -> 冷却截止时间 (防跳-loop)
         self._last_edge_jump_t = 0.0        # 最近一次边缘上跳时间 (防热循环)
+        self._last_patrol_x = None          # 上次巡逻时的玩家位置 (卡住检测主信号)
+        self._last_patrol_y = None
 
     @staticmethod
     def _tkey(target):
@@ -218,11 +220,18 @@ class PatrolMover:
         卡住检测: 名牌失效时玩家坐标不更新, 用"画面是否静止"判断玩家是否真的在动。"""
         if cancel and cancel():
             return
-        # 卡住检测: 一直在走但画面静止 (相机不动=玩家被卡住, 名牌失效也能用)
-        if brain.world_moving():
+        # 卡住检测: 玩家位置在动 OR 画面在动 → 没卡住。
+        # 主信号用玩家位置 (名牌) — 静态相机里走动画面不动, 用画面运动会误判卡住;
+        # 画面运动做名牌失效时的兜底。
+        cur_px, cur_py = brain.player_pos()
+        moved = (self._last_patrol_x is not None
+                 and (abs(cur_px - self._last_patrol_x) >= MOVE_PX_EPS
+                      or abs(cur_py - self._last_patrol_y) >= MOVE_PX_EPS))
+        self._last_patrol_x, self._last_patrol_y = cur_px, cur_py
+        if moved or brain.world_moving():
             self._last_motion_t = time.time()
         elif time.time() - self._last_motion_t > PATROL_STUCK_TIMEOUT:
-            log.info("!! 巡逻卡住(画面静止), 反向脱困跳 + 换向 !!")
+            log.info("!! 巡逻卡住(位置/画面都不动), 反向脱困跳 + 换向 !!")
             back = Direction.LEFT if self.patrol_direction == Direction.RIGHT else Direction.RIGHT
             controller.diagonal_jump(back)
             self._flip()

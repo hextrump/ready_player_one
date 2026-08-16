@@ -42,12 +42,15 @@ class ActionExecutor:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    # ── 键: 动作去重 (目标用粗网格, 容忍微抖) ──
+    # ── 键: 动作去重 (目标用稳定身份 id, 防抖动跨网格边界导致 burst 被反复取消) ──
     @staticmethod
     def _key(action):
         atype, payload = action
         if payload is None:
             return (atype, None)
+        tid = getattr(payload, "id", None)
+        if tid is not None:
+            return (atype, ("id", tid))
         return (atype, (payload.cx // 60, payload.cy // 60))
 
     def set_action(self, action) -> bool:
