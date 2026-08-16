@@ -304,8 +304,10 @@ class PatrolMover:
         if moved or brain.world_moving():
             self._last_motion_t = time.time()
         elif time.time() - self._last_motion_t > PATROL_STUCK_TIMEOUT:
-            log.info("!! 巡逻卡住(位置/画面都不动), 反向脱困跳 + 换向 !!")
+            log.info("!! 巡逻卡住(位置/画面都不动), 反向脱困走+跳 + 换向 !!")
             back = Direction.LEFT if self.patrol_direction == Direction.RIGHT else Direction.RIGHT
+            # 先反向走一小段再跳: 单跳可能原地落回 (几何死角), 走一步更容易脱出
+            controller.move_direction(back, duration=0.5)
             controller.diagonal_jump(back)
             self._flip()
             self._last_motion_t = time.time()
