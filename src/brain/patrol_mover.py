@@ -18,6 +18,7 @@ import math
 import time
 
 from src.brain.game_controller import GameController, Direction
+from src.brain.terrain_graph import TerrainGraph
 from src.utils.logger import get_logger
 
 log = get_logger("patrol_mover")
@@ -69,6 +70,8 @@ class PatrolMover:
         self._last_edge_jump_t = 0.0        # 最近一次边缘上跳时间 (防热循环)
         self._last_patrol_x = None          # 上次巡逻时的玩家位置 (卡住检测主信号)
         self._last_patrol_y = None
+        self._last_platforms = None         # 最近构建图的平台 (变化才重建)
+        self.terrain_graph = None           # 平台可达图 (跳上/跳下, 算一次缓存)
 
     @staticmethod
     def _tkey(target):
@@ -103,6 +106,12 @@ class PatrolMover:
                     return p
         return None
 
+    def _ensure_graph(self, platforms: list) -> None:
+        """平台变化时重建可达图 (O(n²) 但平台少, 且只在变化时算一次)。"""
+        if platforms != self._last_platforms:
+            self._last_platforms = list(platforms)
+            self.terrain_graph = TerrainGraph(self._last_platforms)
+
     # ===== 可及性判断 =====
 
     def support(self, x: int, feet_y: float, platforms: list):
@@ -113,13 +122,24 @@ class PatrolMover:
         return None
 
     def is_reachable(self, target, px: int, py: int, platforms: list) -> bool:
-        """直接可及: 同一行走面, 或跳发范围内 (上登台/下下跳)。"""
+        """直接可及: 同一行走面, 或平台图里一跳可达 (上登台/下跳, 用平台高度差判定)。"""
         dx = abs(target.cx - px)
         dy = py - target.cy
         pfeet = py + PLAYER_FOOT_OFFSET
         tfeet = target.cy + target.h / 2
         if self._same_surface(px, pfeet, target.cx, tfeet, platforms):
             return True
+        # 平台高度差判定: 玩家平台 → 目标平台 图里一跳可达 (比怪中心更准)
+        self._ensure_graph(platforms)
+        if self.terrain_graph is not None:
+            pp = self.support(px, pfeet, platforms)
+            tp = self.support(target.cx, tfeet, platforms)
+            if pp is not None and tp is not None and pp != tp:
+                pi = self.terrain_graph.index_of(pp)
+                ti = self.terrain_graph.index_of(tp)
+                if pi is not None and ti is not None and pi != ti and self.terrain_graph.can_jump_to(pi, ti):
+                    return not self._is_blocked(self._tkey(target))
+        # 回退: 旧 dy/dx 启发式 (玩家/目标不在检测平台上时)
         if (not FLAT_MODE) and dy > JUMP_UP_DY and dx <= JUMP_TO_UPPER_DX:
             return not self._is_blocked(self._tkey(target))   # 跳不上去冷却期内视为不可及
         if (not FLAT_MODE) and dy < -JUMP_DOWN_DY and dx <= JUMP_DOWN_DX:
@@ -139,17 +159,58 @@ class PatrolMover:
 
     def approach(self, controller: GameController, target, px: int, py: int,
                  platforms: list, brain, cancel=None) -> None:
-        """简单接近: 同面 → 水平走; 上近 → 登台跳 (先贴近平台边缘再跳); 下近 → 下跳。做完交给外层重决策。
+        """简单接近: 同面 → 水平走; 平台图一跳可达 → 登台跳/下跳 (先贴近平台边缘再跳); 否则旧启发式。
         cancel: 可选回调, True=决策已变更, 中止走动。"""
         dx = target.cx - px
         dy = py - target.cy
         direction = Direction.RIGHT if target.cx >= px else Direction.LEFT
+        pfeet = py + PLAYER_FOOT_OFFSET
+        tfeet = target.cy + target.h / 2
+
+        # 平台图判定 (用平台高度差, 比怪中心准): 玩家平台 → 目标平台 一跳可达
+        self._ensure_graph(platforms)
+        if self.terrain_graph is not None:
+            pp = self.support(px, pfeet, platforms)
+            tp = self.support(target.cx, tfeet, platforms)
+            if pp is not None and tp is not None and pp != tp:
+                pi = self.terrain_graph.index_of(pp)
+                ti = self.terrain_graph.index_of(tp)
+                if pi is not None and ti is not None and pi != ti:
+                    for j, act in self.terrain_graph.reachable_from(pi):
+                        if j != ti:
+                            continue
+                        if act == 'up':
+                            # 登台跳: 朝目标平台侧走边缘, 贴近后跳 (单跳水平位移有限)
+                            key = self._tkey(target)
+                            if self._is_blocked(key):
+                                return
+                            a = self.terrain_graph.platforms[pi]
+                            b = self.terrain_graph.platforms[ti]
+                            is_right = (b[1] + b[2]) >= (a[1] + a[2])
+                            edge_x = a[2] if is_right else a[1]
+                            if abs(px - edge_x) > EDGE_JUMP_MAX_GAP + 20:
+                                self._walk_toward(controller, edge_x, px, brain, cancel)
+                                return
+                            cnt = self._jump_count.get(key, 0) + 1
+                            self._jump_count[key] = cnt
+                            if cnt >= JUMP_FAIL_LIMIT:
+                                log.info(f"!! 登台跳 {cnt} 次仍不可打, 冷却该目标, 改巡逻 !!")
+                                self._blocked[key] = time.time() + BLOCK_COOLDOWN
+                                self._jump_count.pop(key, None)
+                                return
+                            log.info(f"↑ 登台跳({cnt}/{JUMP_FAIL_LIMIT}) -> {target.name}")
+                            controller.diagonal_jump(Direction.RIGHT if is_right else Direction.LEFT)
+                            return
+                        if act == 'down':
+                            log.info(f"↓ 下跳 -> {target.name}")
+                            controller.jump_down()
+                            return
+
+        # 回退: 旧 dy/dx 启发式 (玩家/目标不在检测平台上时)
         if (not FLAT_MODE) and dy > JUMP_UP_DY and abs(dx) <= JUMP_TO_UPPER_DX:
             key = self._tkey(target)
             if self._is_blocked(key):
                 return  # 冷却期内不再跳, 交给巡逻 (用移动/地形找别的路)
-            # 若该侧存在可跳上的高平台, 且离平台边缘还远 → 先走向边缘, 贴近了再跳
-            # (单次斜跳水平位移有限, 从中间起跳上不去, 是之前卡住的根因)
             sup = self.support(px, py + PLAYER_FOOT_OFFSET, platforms)
             is_right = direction == Direction.RIGHT
             if sup is not None:
