@@ -40,13 +40,14 @@ class TerrainGraph:
 
     @staticmethod
     def _edge(a, b):
-        """a→b 是否可跳 (返回 'up'/'down'/None)。"""
+        """a→b 是否可跳 (返回 'up'/'down'/None)。
+        单向平台可从下方跳上: 只需 a、b 的 x 范围重叠或贴近 (<=GAP), 玩家在重叠处跳起即可落上。
+        这也让"隐含地面"(无限宽)能连到其上方所有平台。"""
         ya, xla, xra = a
         yb, xlb, xrb = b
-        # 跳上: b 更高 (yb<ya), 高度差可跳, b 的 x 范围在 a 边缘可及
+        # 跳上: b 更高, 高度差可跳, x 范围重叠/贴近
         if yb < ya and ya - yb <= EDGE_JUMP_MAX_DY:
-            if (xlb <= xra + EDGE_JUMP_MAX_GAP and xrb >= xra) or \
-               (xrb >= xla - EDGE_JUMP_MAX_GAP and xlb <= xla):
+            if xlb <= xra + EDGE_JUMP_MAX_GAP and xrb >= xla - EDGE_JUMP_MAX_GAP:
                 return 'up'
         # 跳下: b 更低 + x 范围重叠 (可直落)
         if yb > ya and xlb < xra and xrb > xla:

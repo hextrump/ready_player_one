@@ -106,11 +106,21 @@ class PatrolMover:
                     return p
         return None
 
-    def _ensure_graph(self, platforms: list) -> None:
-        """平台变化时重建可达图 (O(n²) 但平台少, 且只在变化时算一次)。"""
-        if platforms != self._last_platforms:
-            self._last_platforms = list(platforms)
-            self.terrain_graph = TerrainGraph(self._last_platforms)
+    def _ensure_graph(self, platforms: list, px=None, pfeet=None):
+        """平台变化时重建可达图 (含玩家表面); 返回玩家当前表面。
+        玩家脚底不在任何检测平台 → 隐含地面节点 (无限宽, 玩家脚底所在层):
+        v13 常漏检地面层, 但玩家脚下一定是某个表面, 没有它就跳不起来。"""
+        graph_platforms = list(platforms)
+        player_surface = (self.support(px, pfeet, platforms)
+                          if (px is not None and pfeet is not None) else None)
+        if player_surface is None and px is not None:
+            player_surface = (pfeet, -10**6, 10**6)   # 隐含地面
+            graph_platforms.append(player_surface)
+        key = tuple(graph_platforms)
+        if key != self._last_platforms:
+            self._last_platforms = key
+            self.terrain_graph = TerrainGraph(graph_platforms)
+        return player_surface
 
     # ===== 可及性判断 =====
 
@@ -122,20 +132,19 @@ class PatrolMover:
         return None
 
     def is_reachable(self, target, px: int, py: int, platforms: list) -> bool:
-        """直接可及: 同一行走面, 或平台图里一跳可达 (上登台/下跳, 用平台高度差判定)。"""
+        """直接可及: 同一行走面, 或平台图里一跳可达 (玩家表面→目标平台, 含隐含地面兜底)。"""
         dx = abs(target.cx - px)
         dy = py - target.cy
         pfeet = py + PLAYER_FOOT_OFFSET
         tfeet = target.cy + target.h / 2
         if self._same_surface(px, pfeet, target.cx, tfeet, platforms):
             return True
-        # 平台高度差判定: 玩家平台 → 目标平台 图里一跳可达 (比怪中心更准)
-        self._ensure_graph(platforms)
-        if self.terrain_graph is not None:
-            pp = self.support(px, pfeet, platforms)
+        # 平台图判定: 玩家表面 (检测平台或隐含地面) → 目标平台 一跳可达
+        p_surface = self._ensure_graph(platforms, px, pfeet)
+        if self.terrain_graph is not None and p_surface is not None:
             tp = self.support(target.cx, tfeet, platforms)
-            if pp is not None and tp is not None and pp != tp:
-                pi = self.terrain_graph.index_of(pp)
+            if tp is not None and p_surface != tp:
+                pi = self.terrain_graph.index_of(p_surface)
                 ti = self.terrain_graph.index_of(tp)
                 if pi is not None and ti is not None and pi != ti and self.terrain_graph.can_jump_to(pi, ti):
                     return not self._is_blocked(self._tkey(target))
@@ -167,13 +176,12 @@ class PatrolMover:
         pfeet = py + PLAYER_FOOT_OFFSET
         tfeet = target.cy + target.h / 2
 
-        # 平台图判定 (用平台高度差, 比怪中心准): 玩家平台 → 目标平台 一跳可达
-        self._ensure_graph(platforms)
-        if self.terrain_graph is not None:
-            pp = self.support(px, pfeet, platforms)
+        # 平台图判定 (玩家表面含隐含地面): 玩家表面 → 目标平台 一跳可达
+        p_surface = self._ensure_graph(platforms, px, pfeet)
+        if self.terrain_graph is not None and p_surface is not None:
             tp = self.support(target.cx, tfeet, platforms)
-            if pp is not None and tp is not None and pp != tp:
-                pi = self.terrain_graph.index_of(pp)
+            if tp is not None and p_surface != tp:
+                pi = self.terrain_graph.index_of(p_surface)
                 ti = self.terrain_graph.index_of(tp)
                 if pi is not None and ti is not None and pi != ti:
                     for j, act in self.terrain_graph.reachable_from(pi):
@@ -187,7 +195,11 @@ class PatrolMover:
                             a = self.terrain_graph.platforms[pi]
                             b = self.terrain_graph.platforms[ti]
                             is_right = (b[1] + b[2]) >= (a[1] + a[2])
-                            edge_x = a[2] if is_right else a[1]
+                            if a[2] - a[1] > 1e5:
+                                # 隐含地面 (无限宽): 走向目标平台下方再跳
+                                edge_x = (b[1] + b[2]) // 2
+                            else:
+                                edge_x = a[2] if is_right else a[1]
                             if abs(px - edge_x) > EDGE_JUMP_MAX_GAP + 20:
                                 self._walk_toward(controller, edge_x, px, brain, cancel)
                                 return
