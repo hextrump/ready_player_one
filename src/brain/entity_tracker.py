@@ -214,51 +214,77 @@ class RopeEntity:
 
 
 class TerrainTracker:
-    """地形持久化: 平台/梯子从"每帧观察"升格为"跨帧状态" (身份 + 融合 + 去抖)。
+    """地形持久化: 平台/梯子在【世界坐标】跨帧融合 (身份 + 融合 + 去抖 + 相机位姿)。
 
-    设计思想对齐: 地形也要像玩家/怪一样"收敛为系统状态", 而不是每帧重新发明。
-    - 融合: 匹配到的实体用加权平均平滑 (y + x 范围), 抗抖动/漂移
-    - 确认: 连续观察 >= MIN_SEEN_FRAMES 才暴露 (滤掉单帧误检的地形)
-    - 生命周期: 长时间没观察到销毁 (相机移动时旧平台让位重建)
+    设计思想: 地形不应随玩家移动 — 内部存世界坐标, 检测到相机平移就修正位姿,
+    暴露时转回屏幕坐标。平台世界位置固定, 不随镜头漂移。
+    - 融合: 匹配到的实体加权平均平滑 (世界坐标 y/x)
+    - 确认: 连续观察 >= MIN_SEEN_FRAMES 才暴露 (滤单帧误检)
+    - 生命周期: 长时间没观察到销毁
+    - 相机位姿: world = screen + offset; 用匹配对 delta 中位数估算平移
     """
 
-    MATCH_Y_TOL = 30      # 平台 y 容差 (与 patrol_mover.SURFACE_TOL_Y 一致)
+    MATCH_Y_TOL = 30      # 平台 y 容差
     MATCH_X_GAP = 25      # x 范围相邻/重叠判同一块
+    PAN_MATCH_GAP = 120   # 平移检测用宽松 x 容差 (相机平移大时仍能匹配上)
     BLEND = 0.7           # 融合权重: 70% 旧 + 30% 新
     MIN_SEEN_FRAMES = 2   # 连续观察门槛 (滤单帧误检)
     DESPAWN_AFTER = 2.0   # 多久没观察销毁 (秒)
+    PAN_THRESH = 6        # 平移检测阈值 (px, 高于抖动)
 
     def __init__(self):
         self._platforms: Dict[int, PlatformEntity] = {}
         self._ropes: Dict[int, RopeEntity] = {}
         self._next_pid = 1
         self._next_rid = 1
+        self._world_offset = (0, 0)  # 相机位姿: world = screen + offset
+
+    @property
+    def world_offset(self) -> tuple:
+        """当前相机位姿 (world = screen + offset)。"""
+        return self._world_offset
 
     @property
     def platforms(self) -> List[tuple]:
-        """当前平台 [(y, x_left, x_right)] (与 PatrolMover 兼容)。"""
-        return [(p.y, p.x_left, p.x_right)
+        """当前平台屏幕坐标 [(y, x_left, x_right)] (world - offset, 供决策/viz)。"""
+        ox, oy = self._world_offset
+        return [(p.y - oy, p.x_left - ox, p.x_right - ox)
                 for p in sorted(self._platforms.values(), key=lambda p: p.id)
                 if p.seen_frames >= self.MIN_SEEN_FRAMES]
 
     @property
     def ropes(self) -> List[tuple]:
-        """当前梯子 [(x, y_top, y_bottom)]。"""
-        return [(r.x, r.y_top, r.y_bottom)
+        """当前梯子屏幕坐标 [(x, y_top, y_bottom)]。"""
+        ox, oy = self._world_offset
+        return [(r.x - ox, r.y_top - oy, r.y_bottom - oy)
                 for r in sorted(self._ropes.values(), key=lambda r: r.id)
                 if r.seen_frames >= self.MIN_SEEN_FRAMES]
 
     def reset(self) -> None:
         self._platforms.clear()
         self._ropes.clear()
+        self._world_offset = (0, 0)
 
     def update(self, platforms: list, ropes: list, now: float | None = None) -> None:
-        """融合平台/梯子观察: 匹配→加权平滑; 未匹配→老化; 超时→销毁。"""
+        """融合屏幕观察 (内部转世界坐标, 自动检测相机平移修正位姿)。"""
         now = time.time() if now is None else now
+        ox, oy = self._world_offset
 
-        # ── 平台融合 ──
+        # 屏幕 → 世界 (当前位姿)
+        dets_w = [(y + oy, xl + ox, xr + ox) for (y, xl, xr) in platforms]
+
+        # 相机平移检测: 匹配对 delta 中位数 = offset 过期量 → 修正位姿后重新转换
+        pan = self._estimate_pan(dets_w)
+        if pan is not None:
+            ox -= pan[0]
+            oy -= pan[1]
+            self._world_offset = (round(ox), round(oy))
+            dets_w = [(y + oy, xl + ox, xr + ox) for (y, xl, xr) in platforms]
+        rope_w = [(x + ox, yt + oy, yb + oy) for (x, yt, yb) in ropes]
+
+        # ── 平台融合 (世界坐标) ──
         used_p = set()
-        for (y, xl, xr) in platforms:
+        for (y, xl, xr) in dets_w:
             pid = self._match_platform(y, xl, xr, used_p)
             if pid is not None:
                 p = self._platforms[pid]
@@ -278,14 +304,13 @@ class TerrainTracker:
         for pid, p in list(self._platforms.items()):
             if pid not in used_p:
                 p.miss_frames += 1
-                # 不重置 seen_frames: 地形错帧(每 TERRAIN_EVERY 帧跑一次)的间隔帧不是"平台消失",
-                # 重置会导致真平台永远达不到确认门槛
+                # 不重置 seen_frames: 地形错帧(每 TERRAIN_EVERY 帧跑一次)的间隔帧不是"平台消失"
                 if now - p.last_seen > self.DESPAWN_AFTER:
                     del self._platforms[pid]
 
-        # ── 梯子融合 ──
+        # ── 梯子融合 (世界坐标) ──
         used_r = set()
-        for (x, yt, yb) in ropes:
+        for (x, yt, yb) in rope_w:
             rid = self._match_rope(x, used_r)
             if rid is not None:
                 r = self._ropes[rid]
@@ -308,6 +333,38 @@ class TerrainTracker:
                 # 同平台: 不重置 seen_frames (错帧间隔不算平台消失)
                 if now - r.last_seen > self.DESPAWN_AFTER:
                     del self._ropes[rid]
+
+    def _estimate_pan(self, dets_w):
+        """用匹配对 delta (检测世界 - 实体世界) 的中位数估算相机平移 (offset 过期量)。"""
+        deltas = []
+        used = set()
+        for (y, xl, xr) in dets_w:
+            best = None
+            for pid, p in self._platforms.items():
+                if pid in used:
+                    continue
+                if abs(p.y - y) > self.MATCH_Y_TOL * 2:   # 平移容忍更大的 y 差
+                    continue
+                if p.x_right < xl - self.PAN_MATCH_GAP or p.x_left > xr + self.PAN_MATCH_GAP:
+                    continue
+                best = pid
+                break
+            if best is not None:
+                p = self._platforms[best]
+                dcx = ((xl + xr) / 2) - ((p.x_left + p.x_right) / 2)
+                dcy = y - p.y
+                deltas.append((dcx, dcy))
+                used.add(best)
+        if len(deltas) < 2:
+            return None
+        # 中位数 (x_delta, y_delta)
+        dxs = sorted(d[0] for d in deltas)
+        dys = sorted(d[1] for d in deltas)
+        mx = dxs[len(dxs) // 2]
+        my = dys[len(dys) // 2]
+        if abs(mx) < self.PAN_THRESH and abs(my) < self.PAN_THRESH:
+            return None
+        return (mx, my)
 
     def _match_platform(self, y, xl, xr, used_p):
         """找与检测 (y, xl, xr) 同一条平台的实体 (y 相近 + x 范围相邻/重叠)。"""
