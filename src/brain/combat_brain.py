@@ -162,6 +162,7 @@ class CombatBrain:
         self._v13_fallback_first_log = True  # v13 Player 兜底首次接管时打一次日志
         self._prev_gray = None               # 帧间运动检测用上一帧灰度
         self._last_action = None             # 上一帧决策 (滞回用: 锁定目标防反复换)
+        self._state_log_count = 0            # 状态机观察日志计数 (每 ~30 帧输出一次)
         self._running = False
         self.state = BrainState.STANDBY
         self.kill_count = 0
@@ -644,6 +645,17 @@ class CombatBrain:
             # 决策 → 推送动作 (ActionExecutor 内部按粗网格键去重, 动作不重复执行不被打断)
             action = self._decide()
             self.executor.set_action(action)
+
+            # 状态机观察日志: 每 ~3 秒输出一次 (供看门狗/Claude 观察状态机是否正确)
+            self._state_log_count += 1
+            if self._state_log_count % 30 == 0:
+                with self._vision_lock:
+                    plats = list(self.world.platforms)
+                pfeet = py + 35
+                sup = self.mover.support(px, pfeet, plats)
+                log.info(f"[STATE] 玩家=({px},{py}) 表面={'平台y=%d' % sup[0] if sup else '地面'} "
+                         f"平台={len(plats)} 怪={len(targets)} 状态={self.state.value} "
+                         f"击杀={self.kill_count} 动作={action[0]}")
 
             # 渲染可视化界面 (每帧, 不再被动作阻塞)
             if show_vision:
