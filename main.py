@@ -73,8 +73,18 @@ class AgentV7:
         
         # 4. Think + Sense (YOLO)
         self.combat_brain = CombatBrain()
-        
+
+        # 无药看门狗接线: 血药用尽/药水无效 → 停战斗brain (防干等死)
+        self.auto_healer.stop_hunting_cb = self._stop_hunting
+        self.auto_healer.return_home_key = load_config().get("key", {}).get("return_home", "")
+
         self._running = False
+
+    def _stop_hunting(self):
+        """无药看门狗回调: 停止狩猎 (角色不再拉怪挨打), 等用户补药重开。"""
+        self.combat_brain.active_hunting = False
+        self.auto_healer.active_hunting = False
+        log.warning("!!! 无药看门狗: 已停止狩猎 (血药用尽/药水无效), 补药后按 F1 重新开始 !!!")
 
     def _poll_hotkeys(self):
         """后台轮询 F1/F 热键 (GetAsyncKeyState, 不装全局钩子)。
