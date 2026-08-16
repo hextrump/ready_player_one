@@ -56,6 +56,7 @@ PLAYER_MISS_DECAY_STEP = 20.0 # 衰减期每帧向中心移动的像素数
 
 ATTACK_RANGE_X = 120  # 水平攻击距离
 ATTACK_RANGE_Y = 30   # 垂直容差
+ATTACK_RANGE_BUFFER = 45  # 决策滞回缓冲: 正在打的怪超出范围这段距离内仍保持攻击 (防射程边界抖动换目标)
 JUMP_ATTACK_RANGE_Y_UP = 120 # 跳发最高打击距离
 
 # Burst 连打参数 (拟人化 + 贴合冒险岛真实战斗节奏)
@@ -160,6 +161,7 @@ class CombatBrain:
         )
         self._v13_fallback_first_log = True  # v13 Player 兜底首次接管时打一次日志
         self._prev_gray = None               # 帧间运动检测用上一帧灰度
+        self._last_action = None             # 上一帧决策 (滞回用: 锁定目标防反复换)
         self._running = False
         self.state = BrainState.STANDBY
         self.kill_count = 0
@@ -539,23 +541,36 @@ class CombatBrain:
         return hit_count
 
     def _decide(self) -> tuple:
-        """三层优先决策 (只读世界状态, 不执行动作): 打 → 接近(直接可及) → 地形巡逻。"""
+        """三层优先决策 (只读世界状态, 不执行动作): 打 → 接近(直接可及) → 地形巡逻。
+        滞回: 正在打的怪用更宽射程锁定, 防止怪在射程边界抖动时反复换目标打断 burst。"""
         with self._vision_lock:
             targets = self.world.targets
             px, py = self.world.player_x, self.world.player_y
             platforms = list(self.world.platforms)
         if not self.active_hunting:
             self.state = BrainState.STANDBY
+            self._last_action = None
             return ("none", None)
         if targets:
             best = self.select_target(targets, px, py)
+            # 滞回: 上一帧在打怪 A → A 还在且大致在范围 → 锁定 A, 不因别的怪更近就换
+            last = self._last_action
+            if best is not None and last is not None and last[0] == "attack" and last[1] is not None:
+                last_id = getattr(last[1], "id", None)
+                for t in targets:
+                    if getattr(t, "id", None) == last_id and self.is_in_attack_range(t, px, py, buffer_x=ATTACK_RANGE_BUFFER):
+                        best = t
+                        break
             if best and self.is_in_attack_range(best, px, py):
                 self.state = BrainState.ATTACKING
+                self._last_action = ("attack", best)
                 return ("attack", best)
             if best and self.mover.is_reachable(best, px, py, platforms):
                 self.state = BrainState.APPROACHING
+                self._last_action = ("approach", best)
                 return ("approach", best)
         self.state = BrainState.PATROLLING
+        self._last_action = ("patrol", None)
         return ("patrol", None)
 
     def _action_worker(self, action_id: int, action: tuple) -> None:
