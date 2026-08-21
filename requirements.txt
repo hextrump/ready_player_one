@@ -3,7 +3,6 @@
 # ============================================
 
 # --- Screen Capture ---
-mss>=9.0.0
 windows-capture>=1.5.0   # DXGI 抓屏 (比 PrintWindow/BitBlt 快一个数量级)
 
 # --- YOLO Object Detection ---
@@ -12,22 +11,11 @@ ultralytics>=8.1.0
 # --- OpenCV ---
 opencv-python>=4.9.0.0
 
-# --- OCR ---
-paddlepaddle>=2.6.0
-paddleocr>=2.7.0
-
-# --- State Machine ---
-transitions>=0.9.0
-
-# --- Keyboard/Mouse Control ---
-pydirectinput>=1.0.4
-pyautogui>=0.9.54
+# --- Window / Input ---
+pywin32>=306            # win32gui/win32api: 窗口查找 + DirectInput 注入
 
 # --- Configuration ---
 pyyaml>=6.0.1
-
-# --- VLM (Gemini) ---
-google-generativeai>=0.4.0
 
 # --- Data Processing ---
 numpy>=1.24.0
