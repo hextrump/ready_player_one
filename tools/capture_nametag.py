@@ -1,16 +1,17 @@
 """
 采集玩家名牌模板 + 角色中心偏移 (供 NametagLocator 使用)
 ========================================================
-用法: python tools/capture_nametag.py --process Maplestory_Classic.exe
+用法: python tools/capture_nametag.py --player player0_warrior
 
 操作:
   1. 左键拖框: 框住名牌 (紧贴名牌板, 不含背景)
   2. 再单击:   标记角色中心 (身体/头部)
   [R] 重抓帧并重来   [C] 预览裁剪+偏移   [S] 保存   [Q] 退出
 
-保存:
-  models/nametag/nametag.png         (BGR 裁剪, 与 WindowCapture.grab() 通道一致)
-  models/nametag/nametag_offset.json {"offset_x": int, "offset_y": int}
+保存 (指定 --player 时):
+  data/player/<player>/nametag.png         (BGR 裁剪, 与 WindowCapture.grab() 通道一致)
+  data/player/<player>/nametag_offset.json {"offset_x": int, "offset_y": int}
+不指定 --player 时落到旧的全局路径 models/nametag/ (兼容, 但运行时不再读它)
   offset = 角色中心 − 名牌左上角
 """
 import argparse
@@ -28,9 +29,28 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from src.capture.window_capture import WindowCapture
 
+# 默认落盘目录 (未指定 --player 时的兼容路径)。
+# 指定 --player <模板> 时改为存进该模板目录 —— 名牌是**角色的身份凭证**, 应该跟着模板走,
+# 不该沉淀成一个全局文件被下一个角色悄悄继承 (见 src/utils/player_profile._resolve_identity)。
 SAVE_DIR = os.path.join("models", "nametag")
 TEMPLATE_PATH = os.path.join(SAVE_DIR, "nametag.png")
 OFFSET_PATH = os.path.join(SAVE_DIR, "nametag_offset.json")
+
+
+def set_save_target(player: str | None) -> None:
+    """把落盘目标切到某个玩家模板目录 (data/player/<player>/nametag.png)。"""
+    global SAVE_DIR, TEMPLATE_PATH, OFFSET_PATH
+    if not player:
+        return
+    d = os.path.join(PROJECT_ROOT, "data", "player", player)
+    if not os.path.isdir(d):
+        print(f"[ERROR] 模板目录不存在: {d}")
+        print(f"        可用模板: python tools/swap_player.py --list")
+        sys.exit(1)
+    SAVE_DIR = d
+    TEMPLATE_PATH = os.path.join(d, "nametag.png")
+    OFFSET_PATH = os.path.join(d, "nametag_offset.json")
+    print(f"[OK] 名牌将保存到模板 {player}: {TEMPLATE_PATH}")
 
 # ============ 交互状态 ============
 state = {
@@ -104,7 +124,11 @@ def save():
 def main():
     parser = argparse.ArgumentParser(description="采集玩家名牌模板 + 角色中心偏移")
     parser.add_argument("--process", default="Maplestory_Classic.exe", help="游戏进程名")
+    parser.add_argument("--player", default=None,
+                        help="保存到该玩家模板目录 (data/player/<player>/nametag.png)。"
+                             "不填则存旧的全局路径 models/nametag/")
     args = parser.parse_args()
+    set_save_target(args.player)
 
     wc = WindowCapture(process_name=args.process)
     if not wc.find_window():

@@ -16,6 +16,11 @@ from typing import Dict, List, Tuple
 # 跳参数 (与 patrol_mover 一致)
 EDGE_JUMP_MAX_DY = 140   # 单次上跳最大高度差 (px)
 EDGE_JUMP_MAX_GAP = 60   # 上跳最大水平缝隙 (px)
+# 认定"下面还有一层"的最小高度差。低于它就是**同一层**被地形融合抖出来的几像素误差 ——
+# 2026-08-19 实测: 玩家踩隐含地面(无限宽, x 上与每块平台都重叠)时, 一块只低 4px 的平台
+# 就会连出一条 'down' 边 → 决策以为要下一层 → 在最底层反复按 ↓+Alt (空动作) 原地抽搐。
+# 取 50: 大于表面判定容差 SURFACE_TOL_Y(30) + 跨帧融合抖动, 小于真实一层楼高。
+MIN_DROP_DY = 50
 
 
 class TerrainGraph:
@@ -49,8 +54,8 @@ class TerrainGraph:
         if yb < ya and ya - yb <= EDGE_JUMP_MAX_DY:
             if xlb <= xra + EDGE_JUMP_MAX_GAP and xrb >= xla - EDGE_JUMP_MAX_GAP:
                 return 'up'
-        # 跳下: b 更低 + x 范围重叠 (可直落)
-        if yb > ya and xlb < xra and xrb > xla:
+        # 跳下: b 确实低了一层 (>= MIN_DROP_DY) + x 范围重叠 (可直落)
+        if yb - ya >= MIN_DROP_DY and xlb < xra and xrb > xla:
             return 'down'
         return None
 
