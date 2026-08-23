@@ -11,32 +11,61 @@ env/
 venv/
 .env
 
-# --- YOLO 数据集 & 训练输出 ---
-# 数据集非常大, 不入仓
+# --- 训练数据/缓存 (不入仓, 占空间太大, 由 Syncthing/本地管理) ---
 data/
+cache/
 runs/
 train.log
+*.log
 check_output/
+synth_*/
+labels.*.csv
+labels.csv
+yolo_dataset/
+datasets/
+wandb/
 
-# --- Logs ---
-logs/
+# --- Models: 走 LFS (.gitattributes 配) ---
+# *.pt 由 .gitattributes 接管, 不在这里 ignore
+models/.stfolder/
+models/nametag/*_backup.*
+models/nametag/*_old.*
 
-# --- Models ---
-# 模型权重不入仓 (单独云同步或 LFS)
-models/
-*.pt
-*.onnx
-*.engine
+# --- 数据库缓存 (训练/构建产物, 重建成本低) ---
+*.db-journal
+*.db-wal
+*.db-shm
+meowdb/
+world.db
+map_db/
+mapledata_extracted/
+
+# --- 测试临时图 ---
+tests/*.png
+
+# --- 设计文档草稿/中间产物 ---
+design/_drafts/
+design/_tmp/
+
+# --- 训练脚本(训练机专用, 不入仓) ---
+# 训练脚本有版本/数据耦合, 在训练机上迭代更快, 不污染 main
+train_multimap.py
+scripts/annotate_geometry.py
+scripts/build_synth_dataset.py
+scripts/download_full_renders.py
+scripts/download_sprites.py
+scripts/merge_mapledata.py
+scripts/watch_train_progress.py
+
+# --- 训练机实验性脚本(待评估是否通用, 暂不入仓) ---
+scripts/build_world_db.py
+scripts/verify_multimap.py
+
+# --- 未训练/未使用模型下载(本地调试用) ---
+yolo26n.pt
 
 # --- Claude Code 配置 ---
 .claude/
 
 # --- User Config ---
 config.yaml
-
-# --- Syncthing 内部目录 (非模型, 不同步) ---
-models/.stfolder/
-
-# --- 名牌模板备份 (非必需, 不同步) ---
-models/nametag/*_backup.*
-models/nametag/*_old.*

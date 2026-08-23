@@ -1,1 +1,8 @@
+# 模型权重走 Git LFS — 训练机导出, 其他机器 git lfs pull 即可
 *.pt filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.engine filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+
+# 大型渲染图(地图完整 render > 1MB 的)走 LFS, 单图不进仓
+*.png filter=lfs diff=lfs merge=lfs -text
