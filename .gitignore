@@ -45,6 +45,7 @@ tests/*.png
 
 # --- 设计文档草稿/中间产物 ---
 design/_drafts/
+design/_local/
 design/_tmp/
 
 # --- 训练脚本(训练机专用, 不入仓) ---
