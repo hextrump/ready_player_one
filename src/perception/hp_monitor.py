@@ -101,6 +101,30 @@ class HPMonitor:
             return None
         return max(valid, key=lambda b: b[2] * b[3])
 
+    def _find_hp_by_gray(self, frame, mp_fill):
+        """低血量兜底: HP 红条几乎空 (红色填充找不到) → 在 MP 左侧同行找灰色空条 (HP 条本体)。
+        红条空 = 角色濒死, 正是最需要读 HP 的时刻; 不能因为找不到红色就校准失败。"""
+        mx, my, mw, mh = mp_fill
+        h, w = frame.shape[:2]
+        x1 = min(w, mx)  # MP 左侧
+        best_w, best_left, best_y = 0, 0, my
+        for yy in range(max(0, my - 3), min(h, my + mh + 3)):
+            row = frame[yy]
+            left = None
+            for xx in range(x1 - 1, -1, -1):
+                b, g, r = map(int, row[xx])
+                if self._is_gray_bar(b, g, r):
+                    left = xx
+                else:
+                    break
+            if left is not None:
+                ww = x1 - left
+                if ww > best_w:
+                    best_w, best_left, best_y = ww, left, yy
+        if best_w < 15:
+            return None
+        return (best_left, best_y, best_w, mh)
+
     def _expand_to_full_bar(self, frame, bar_type, fill_bbox):
         """沿填充纵向范围逐行向两侧扩展, 取最宽的一行作为条的全宽 (填充色 + 浅灰空余)。
         最宽不足 10px → 非条 (图标/误检), 返回 None。"""
@@ -137,13 +161,18 @@ class HPMonitor:
         """找 HP/MP 条并扩展到全宽。以 MP 蓝条为锚, HP 红条只在 MP 左侧同行找。
         放宽到低血量小填充 (细条也能命中); 扩展后过窄 → 视为非条, 失败待下帧重试。"""
         h_img = frame.shape[0]
-        roi_top = int(h_img * 0.85)  # 条在底部 UI
+        # roi_top 0.85 会把条上方 y=655 附近的蓝色 UI 误当 MP 条 (真条在 ~98% 帧高);
+        # 收紧到 0.90 排除条上方内容, 只搜底部真条
+        roi_top = int(h_img * 0.90)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
         # MP 先找 (满条宽扁, 用高宽高比过滤方形技能图标)
         mp_fill = self._find_fill_bbox(hsv, 'MP', roi_top, min_aspect=2.5)
         # HP 固定在 MP 左侧同行, 不限宽高比 (低血量时是细条)
         hp_fill = self._find_fill_bbox(hsv, 'HP', roi_top, right_limit=mp_fill[0]) if mp_fill else None
+        # 低血量兜底: 红条空 → 用 MP 左侧的灰色空条当 HP 条 (否则校准失败读不出濒死)
+        if hp_fill is None and mp_fill is not None:
+            hp_fill = self._find_hp_by_gray(frame, mp_fill)
 
         layout_ok = (
             mp_fill is not None and hp_fill is not None

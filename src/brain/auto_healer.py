@@ -19,6 +19,11 @@ from src.utils.logger import get_logger
 
 log = get_logger("auto_heal")
 
+# 无药看门狗: HP 持续低于阈值多少秒判定"血药用尽/药水无效" (防干等死)
+NO_POTION_TIMEOUT = 12.0
+# 回城键 (配置; 空 = 只停止狩猎, 不按回城)
+RETURN_HOME_KEY = ""
+
 
 class AutoHealer:
     def __init__(
@@ -39,7 +44,10 @@ class AutoHealer:
         self.mp_threshold = mp_threshold
         self.check_interval = check_interval
         self.active_hunting = False
-        
+        self.stop_hunting_cb = None    # 无药看门狗触发时回调 (Agent 接线停战斗brain)
+        self.return_home_key = RETURN_HOME_KEY  # 回城键 (可被 Agent 从 config 覆盖; 空=只停不打)
+
+        self._hp_low_start = None     # HP 开始低于阈值的时间 (无药看门狗)
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -73,14 +81,38 @@ class AutoHealer:
                     continue
 
                 frame = self.wc.grab()
+                # 周期重校准 (每 ~30s): 启动时校准的 bbox 可能陈旧 (游戏状态变/条移位),
+                # 陈旧 bbox 会绕过灰条兜底读到错误值 (如 0%), 周期重校可修正
+                self._loop_count = getattr(self, '_loop_count', 0) + 1
+                if self._loop_count % 75 == 0:
+                    self.hp_monitor.calibrate(frame)
                 vitals = self.hp_monitor.read(frame)
 
                 # 检查 HP
                 if vitals.hp_critical:
+                    # 无药看门狗: HP 持续低于阈值 → 药水没作用/血药用尽
+                    if self._hp_low_start is None:
+                        self._hp_low_start = time.time()
+                    if time.time() - self._hp_low_start > NO_POTION_TIMEOUT:
+                        log.warning(f"!!! HP 持续低于阈值 {NO_POTION_TIMEOUT:.0f}s (血药用尽/药水无效), 停止狩猎防死亡 !!"
+                                    f" (最后读数 {vitals.hp_display})")
+                        if self.return_home_key:
+                            self.ctrl.tap_key(self.return_home_key)
+                        self.active_hunting = False
+                        if self.stop_hunting_cb:
+                            try:
+                                self.stop_hunting_cb()
+                            except Exception:
+                                pass
+                        self._hp_low_start = None  # 防连报 (等用户手动处理)
+                        time.sleep(5)  # 停止后冷静一下
+                        continue
                     log.warning(f"检测血量极低 ({vitals.hp_display})，自动使用 HP 药水 [A]")
                     self.ctrl.tap_key("a")
                     time.sleep(0.5) # 喝药 CD
-                
+                else:
+                    self._hp_low_start = None  # HP 恢复 → 重置看门狗
+
                 # 检查 MP
                 if vitals.mp_critical:
                     log.warning(f"检测蓝量极低 ({vitals.mp_display})，自动使用 MP 药水 [S]")

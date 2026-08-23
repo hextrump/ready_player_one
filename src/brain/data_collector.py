@@ -74,10 +74,7 @@ class DataCollector:
                     norm_w = min(1.0, max(0.0, float(bw / w)))
                     norm_h = min(1.0, max(0.0, float(bh / h)))
                     
-                    # 统合转换：如果原模型输出为 4(Toy Bear) 或 5(Wild Boar)，将其映射为统一的 1(Monster)
-                    if cls_id in [4, 5]:
-                        cls_id = 1
-                        
+                    # 类 id 原样保存 (010001010 为 0-9 多类; 4=Stump, 5=Slime 是合法怪类, 不能重映射)
                     f.write(f"{cls_id} {norm_x:.6f} {norm_y:.6f} {norm_w:.6f} {norm_h:.6f}\n")
                     
             if is_hard_example or prefix:
@@ -120,9 +117,11 @@ class DataCollector:
         has_hard_boxes = False
         for box in yolo_results.boxes:
             conf = float(box.conf[0])
-            name = yolo_results.names[int(box.cls[0])]
-            # 如果认出了怪物、玩家，但是信心度在 0.20 到 0.40 之间（半懂不懂）
-            if (name == "Monster" or name == "Player") and 0.20 <= conf <= 0.40:
+            cls_id = int(box.cls[0])
+            name = yolo_results.names[cls_id]
+            # 如果认出了怪物(010001010 类 1-7)、玩家，但是信心度在 0.20 到 0.40 之间（半懂不懂）
+            is_monster = 1 <= cls_id <= 7
+            if (is_monster or name == "Player") and 0.20 <= conf <= 0.40:
                 has_hard_boxes = True
                 break
                 

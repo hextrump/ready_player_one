@@ -1,0 +1,72 @@
+"""
+TerrainGraph — 平台可达图 (世界树第一步: 图→树投影, 派生边算一次缓存)。
+
+节点 = 平台 (y, x_left, x_right), 边 = 跳上/跳下 可跳关系。
+构建后 support/_find_upper_platform 的 O(n) 扫描可变 O(1) 查表;
+is_reachable/approach 用平台高度差判定 (不是怪中心), 是"隔层跳"规划的地基。
+
+跳参数 (与 patrol_mover 对齐):
+- 上跳: 高度差 <= EDGE_JUMP_MAX_DY, 目标平台 x 范围在源平台边缘可及
+- 下跳: 目标更低 + x 范围重叠 (可直落, 无高度限制)
+"""
+from __future__ import annotations
+
+from typing import Dict, List, Tuple
+
+# 跳参数 (与 patrol_mover 一致)
+EDGE_JUMP_MAX_DY = 140   # 单次上跳最大高度差 (px)
+EDGE_JUMP_MAX_GAP = 60   # 上跳最大水平缝隙 (px)
+# 认定"下面还有一层"的最小高度差。低于它就是**同一层**被地形融合抖出来的几像素误差 ——
+# 2026-08-19 实测: 玩家踩隐含地面(无限宽, x 上与每块平台都重叠)时, 一块只低 4px 的平台
+# 就会连出一条 'down' 边 → 决策以为要下一层 → 在最底层反复按 ↓+Alt (空动作) 原地抽搐。
+# 取 50: 大于表面判定容差 SURFACE_TOL_Y(30) + 跨帧融合抖动, 小于真实一层楼高。
+MIN_DROP_DY = 50
+
+
+class TerrainGraph:
+    """平台可达图: 计算一次, 缓存跳上/跳下边。"""
+
+    def __init__(self, platforms: List[tuple]):
+        self.platforms = list(platforms)          # [(y, x_left, x_right)]
+        self.index: Dict[tuple, int] = {}         # platform -> index
+        self.adj: Dict[int, List[Tuple[int, str]]] = {}  # i -> [(j, 'up'|'down')]
+        self._build()
+
+    def _build(self):
+        n = len(self.platforms)
+        self.index = {p: i for i, p in enumerate(self.platforms)}
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                act = self._edge(self.platforms[i], self.platforms[j])
+                if act:
+                    self.adj.setdefault(i, []).append((j, act))
+
+    @staticmethod
+    def _edge(a, b):
+        """a→b 是否可跳 (返回 'up'/'down'/None)。
+        单向平台可从下方跳上: 只需 a、b 的 x 范围重叠或贴近 (<=GAP), 玩家在重叠处跳起即可落上。
+        这也让"隐含地面"(无限宽)能连到其上方所有平台。"""
+        ya, xla, xra = a
+        yb, xlb, xrb = b
+        # 跳上: b 更高, 高度差可跳, x 范围重叠/贴近
+        if yb < ya and ya - yb <= EDGE_JUMP_MAX_DY:
+            if xlb <= xra + EDGE_JUMP_MAX_GAP and xrb >= xla - EDGE_JUMP_MAX_GAP:
+                return 'up'
+        # 跳下: b 确实低了一层 (>= MIN_DROP_DY) + x 范围重叠 (可直落)
+        if yb - ya >= MIN_DROP_DY and xlb < xra and xrb > xla:
+            return 'down'
+        return None
+
+    def index_of(self, platform: tuple) -> int | None:
+        """平台 → 节点 index (平台不在图中返回 None)。"""
+        return self.index.get(platform)
+
+    def reachable_from(self, i: int) -> List[Tuple[int, str]]:
+        """从节点 i 可直接跳到的 [(j, action)]。"""
+        return self.adj.get(i, [])
+
+    def can_jump_to(self, i: int, j: int) -> bool:
+        """i 能否一跳 (上或下) 到 j。"""
+        return any(t == j for t, _ in self.adj.get(i, []))
