@@ -50,7 +50,7 @@ design/_tmp/
 
 # --- 训练脚本(训练机专用, 不入仓) ---
 # 训练脚本有版本/数据耦合, 在训练机上迭代更快, 不污染 main
-train_multimap.py
+# 注: train_multimap.py 已在 runs/ 下, 被 runs/ 一行覆盖
 scripts/annotate_geometry.py
 scripts/build_synth_dataset.py
 scripts/download_full_renders.py
@@ -61,9 +61,6 @@ scripts/watch_train_progress.py
 # --- 训练机实验性脚本(待评估是否通用, 暂不入仓) ---
 scripts/build_world_db.py
 scripts/verify_multimap.py
-
-# --- 未训练/未使用模型下载(本地调试用) ---
-yolo26n.pt
 
 # --- Claude Code 配置 ---
 .claude/
