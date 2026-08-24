@@ -31,6 +31,7 @@ LieDetectorModel 是其他代码 (bot 视觉线程、离线脚本、其它机器
 """
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -39,7 +40,9 @@ import numpy as np
 
 from src.utils.logger import get_logger
 
+from .hybrid_backend import HybridBackend
 from .opencv_backend import OpenCVBackend
+from .remote_backend import RemoteBackend
 from .samurai_backend import SamuraiBackend
 from .state import (
     LieBackend, LieDetectResult, LiePhase,
@@ -86,13 +89,43 @@ class LieDetectorModel:
             deactivate_after=cfg.deactivate_after_frames,
         )
 
-        # 后端: 默认 OpenCV 必须成功; SAMURAI 失败时自动降级 OpenCV
+        # 后端: 默认 OpenCV 必须成功; SAMURAI/HYBRID/REMOTE 失败时自动降级 OpenCV
         self._opencv = OpenCVBackend(self._repo_path)
         self._samurai: Optional[SamuraiBackend] = None
-        if self._backend_name is LieBackend.SAMURAI:
+        self._hybrid: Optional[HybridBackend] = None
+        self._remote: Optional[RemoteBackend] = None
+        if self._backend_name is LieBackend.REMOTE:
+            remote_cfg: dict[str, Any] = {}
+            if config and isinstance(config.get("remote"), dict):
+                remote_cfg = config["remote"]
+            host = str(remote_cfg.get("host", "") or "")
+            if not host:
+                log.warning("[model] REMOTE 后端缺少 remote.host, 降级 OpenCV")
+                self._backend_name = LieBackend.OPENCV
+            else:
+                fallback_detect = None
+                if str(remote_cfg.get("fallback", "none")) == "opencv":
+                    fallback_detect = self._opencv.detect
+                self._remote = RemoteBackend(
+                    host=host,
+                    port=int(remote_cfg.get("port", 8600)),
+                    timeout=float(remote_cfg.get("timeout", 1.0)),
+                    jpeg_quality=int(remote_cfg.get("jpeg_quality", 85)),
+                    fallback=fallback_detect,
+                )
+                log.info(f"[model] REMOTE 后端就绪: {host}:{remote_cfg.get('port', 8600)}")
+        elif self._backend_name is LieBackend.SAMURAI:
             self._samurai = SamuraiBackend(self._repo_path)
             if not self._samurai.ready:
                 log.warning(f"[model] SAMURAI 不可用, 降级 OpenCV: {self._samurai.import_error}")
+                self._backend_name = LieBackend.OPENCV
+        elif self._backend_name is LieBackend.HYBRID:
+            hybrid_cfg = None
+            if config and "hybrid" in config:
+                hybrid_cfg = config["hybrid"]
+            self._hybrid = HybridBackend(self._repo_path, hybrid_cfg)
+            if not self._hybrid.ready:
+                log.warning(f"[model] HYBRID 不可用, 降级 OpenCV: {self._hybrid.import_error}")
                 self._backend_name = LieBackend.OPENCV
 
         # 计时: 用于 timeout_sec 强制解除 (防检测卡住永远不释放)
@@ -107,6 +140,11 @@ class LieDetectorModel:
             f"deact{cfg.deactivate_after_frames}/inflate{cfg.bbox_inflate_ratio:.2f} "
             f"timeout={self._timeout_sec:.0f}s"
         )
+
+        # 后台预热 UETrack (13s 一次性构建): 测谎倒计时仅 ~7s, 首次弹窗现场构建会整段错过。
+        # daemon 线程, 不阻塞 bot 启动; 无 SOT 后端时 no-op。
+        if self._hybrid is not None and self._hybrid.sot_ready:
+            threading.Thread(target=self.warm, daemon=True, name="uetrack-warm").start()
 
     # ── 公共属性 ──
 
@@ -127,6 +165,15 @@ class LieDetectorModel:
     def samurai_ready(self) -> bool:
         return self._samurai is not None and self._samurai.ready
 
+    @property
+    def hybrid_ready(self) -> bool:
+        return self._hybrid is not None and self._hybrid.ready
+
+    @property
+    def sot_inited(self) -> bool:
+        """hybrid 后端 SOT 模板是否已 init (Phase 2 UETrack 才有意义)。"""
+        return self._hybrid is not None and self._hybrid.sot_inited
+
     # ── 主入口: 每帧调用 ──
 
     def update(self, frame: np.ndarray) -> LieDetectResult:
@@ -140,8 +187,15 @@ class LieDetectorModel:
             未触发时 active=False, target_center=None;
             触发时 active=True, target_center=(cx, cy), confidence/brightness 可用。
         """
-        # OpenCV 后端: 每帧独立检测
-        raw = self._opencv.detect(frame)
+        # REMOTE: 服务端负责检测 + 去抖 + 超时, 本机直接透传 (跳过本地去抖)
+        if self._backend_name is LieBackend.REMOTE and self._remote is not None:
+            return self._remote.update(frame)
+
+        # 路由到当前后端 (hybrid 有状态, 其余每帧独立)
+        if self._backend_name is LieBackend.HYBRID and self._hybrid is not None:
+            raw = self._hybrid.detect(frame)
+        else:
+            raw = self._opencv.detect(frame)
 
         # 阶段判定启发式: confidence 高 + 连续多帧中心稳定 = COUNTDOWN;
         # 否则 = TRACKING (目标在动)。这里用简单判定, 复杂逻辑留给调用方。
@@ -172,12 +226,22 @@ class LieDetectorModel:
             return raw
         return LieDetectResult(active=False, backend=raw.backend)
 
+    def warm(self) -> bool:
+        """启动预热 UETrack (13s 一次性构建)。后台线程调用, 不阻塞调用方。"""
+        if self._hybrid is not None:
+            return self._hybrid.warm()
+        return False
+
     def reset(self) -> None:
         """重置去抖状态 (e.g. 测谎意外中途退出后想立刻重新进入)。"""
+        if self._backend_name is LieBackend.REMOTE and self._remote is not None:
+            self._remote.clear()   # 强制服务端结束会话, 下个弹窗重新 init
         self._debounce.active = False
         self._debounce.candidate_active = False
         self._debounce.hit_streak = 0
         self._debounce.miss_streak = 0
         self._debounce.activated_at = 0.0
         self._last_active_at = 0.0
+        if self._hybrid is not None:
+            self._hybrid.reset()   # 清空 bg 模型 / kalman / SOT 模板跨帧状态
         log.info("[model] 状态已重置")

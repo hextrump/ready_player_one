@@ -21,6 +21,8 @@ class LieBackend(str, Enum):
     """跟踪后端选择。"""
     OPENCV = "opencv"           # CPU, 多阈值 + 模板跟踪兜底
     SAMURAI = "samurai"         # GPU, OpenCV 初始定位 + SAM2.1 propagate
+    HYBRID = "hybrid"           # CPU, 白块 + 自适应背景 + 时序差分 + Kalman + (UETrack SOT)
+    REMOTE = "remote"           # 全远程: opencv+samurai 检测都在 hhh 服务端, 本机只发帧收结果
 
 
 @dataclass

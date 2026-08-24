@@ -48,7 +48,7 @@ from src.state.events import EventType, GameEvent
 from src.state.ledger import BrainLedger
 from src.utils.logger import get_logger
 from src.utils.player_profile import get_profile
-from src.utils.config import load_config
+from src.utils.config import PROJECT_ROOT, load_config
 
 log = get_logger("combat_brain")
 
@@ -311,7 +311,8 @@ class CombatBrain:
         self._mouse_tracker: MouseTracker | None = None
         self._lie_active_logged = False   # 防激活日志刷屏
         ld_cfg = load_config().get("lie_detector", {})
-        if ld_cfg.get("enabled", False):
+        # 默认开启: F1 挂机中监测测谎弹窗; 显式 enabled:false 才关闭
+        if ld_cfg.get("enabled", True):
             self._init_lie_detector(ld_cfg)
         else:
             log.info("[LIE] lie_detector.enabled=false (配置关闭), 不初始化")
@@ -365,23 +366,33 @@ class CombatBrain:
                     w.seq = self._frame_idx
 
                     # ── 测谎仪检测 (独立通道; 与怪/地形互不影响) ──
+                    # F1 挂机中才监测弹窗; F 停止则清掉测谎状态, 让跟随线程退出、恢复战斗
                     if self._lie_detector is not None:
-                        lie = self._lie_detector.update(frame)
-                        prev_active = w.lie_active
-                        w.lie_active = lie.active
-                        w.lie_target_center = lie.target_center if lie.active else None
-                        w.lie_target_bbox = lie.target_bbox if lie.active else None
-                        w.lie_confidence = lie.confidence
-                        w.lie_brightness = lie.brightness
-                        w.lie_phase = lie.phase.value if lie.phase else "idle"
-                        # 激活/解除时记日志 (不刷屏)
-                        if lie.active and not prev_active:
-                            log.info(f"[LIE] 测谎仪 ACTIVE  conf={lie.confidence:.2f} "
-                                     f"phase={w.lie_phase} target={lie.target_center}")
-                            self._lie_active_logged = True
-                        elif not lie.active and prev_active:
-                            log.info("[LIE] 测谎仪 CLEARED, 恢复战斗")
+                        if self.active_hunting:
+                            lie = self._lie_detector.update(frame)
+                            prev_active = w.lie_active
+                            w.lie_active = lie.active
+                            w.lie_target_center = lie.target_center if lie.active else None
+                            w.lie_target_bbox = lie.target_bbox if lie.active else None
+                            w.lie_confidence = lie.confidence
+                            w.lie_brightness = lie.brightness
+                            w.lie_phase = lie.phase.value if lie.phase else "idle"
+                            # 激活/解除时记日志 (不刷屏)
+                            if lie.active and not prev_active:
+                                log.info(f"[LIE] 测谎仪 ACTIVE  conf={lie.confidence:.2f} "
+                                         f"phase={w.lie_phase} target={lie.target_center}")
+                                self._lie_active_logged = True
+                            elif not lie.active and prev_active:
+                                log.info("[LIE] 测谎仪 CLEARED, 恢复战斗")
+                                self._lie_active_logged = False
+                        elif w.lie_active:
+                            # F 停止挂机 → 强制解除测谎 (reset 去抖 + 清快照), 恢复战斗
+                            w.lie_active = False
+                            w.lie_target_center = None
+                            w.lie_target_bbox = None
+                            self._lie_detector.reset()
                             self._lie_active_logged = False
+                            log.info("[LIE] F 停止挂机, 测谎跟随退出, 恢复战斗")
 
                 # 定时心跳截图 (仅常规样本, 每 save_interval_seconds 秒一帧)
                 # 只挂机中采集; 按 F 停止 (active_hunting=False) 后不再自动截图
@@ -872,17 +883,24 @@ class CombatBrain:
     def _init_lie_detector(self, ld_cfg: dict) -> None:
         """从 config 初始化 LieDetectorModel + MouseTracker。失败不阻塞 bot。"""
         repo = ld_cfg.get("detector_repo_path", "")
-        if not repo:
+        backend = ld_cfg.get("backend", "opencv")
+        # REMOTE 后端不需要本机 vendored 仓库 (检测全在服务端); 其余后端必须有
+        if backend != "remote" and not repo:
             log.warning("[LIE] config.lie_detector.detector_repo_path 未配置, 跳过")
+            return
+        if repo and not Path(repo).is_dir():
+            log.warning(f"[LIE] lie_detector 仓库目录不存在: {repo} → 禁用 (落地后重启生效)")
             return
         try:
             self._lie_detector = LieDetectorModel(
-                detector_repo_path=repo,
-                backend=ld_cfg.get("backend", "opencv"),
+                detector_repo_path=repo or str(PROJECT_ROOT / "models" / "lie_detector"),
+                backend=backend,
                 config={
                     "activate_after_frames": ld_cfg.get("activate_after_frames", 2),
                     "deactivate_after_frames": ld_cfg.get("deactivate_after_frames", 6),
                     "timeout_sec": ld_cfg.get("timeout_sec", 30.0),
+                    "hybrid": ld_cfg.get("hybrid"),   # hybrid 子配置 (bg/kalman/fusion/uetrack)
+                    "remote": ld_cfg.get("remote"),   # remote 子配置 (host/port/timeout/jpeg_quality/fallback)
                 },
             )
             # MouseTracker 需要 hwnd, run() 时再注入; 这里先存 cfg

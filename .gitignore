@@ -31,6 +31,12 @@ models/.stfolder/
 models/nametag/*_backup.*
 models/nametag/*_old.*
 
+# vendored 第三方检测仓库/权重 (本机本地资产, 不传 GitHub; hhh 服务端用外部项目)
+# 训练机本地迭代, 不入仓
+models/lie_detector/
+models/uetrack_repo/
+models/uetrack_weights/
+
 # --- 数据库缓存 (训练/构建产物, 重建成本低) ---
 *.db-journal
 *.db-wal
@@ -42,6 +48,8 @@ mapledata_extracted/
 
 # --- 测试临时图 ---
 tests/*.png
+tools/*.png
+tools/01.mp4
 
 # --- 设计文档草稿/中间产物 ---
 design/_drafts/

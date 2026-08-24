@@ -63,12 +63,23 @@ def _resolve_paths(cfg: dict) -> None:
     path_keys = [
         ("yolo", "model_path"),
         ("state_bus", "db_path"),
+        ("lie_detector", "detector_repo_path"),  # 测谎仪 vendored 仓库 (models/lie_detector) 相对路径 → 绝对
+        ("lie_detector", "hybrid", "uetrack", "repo_path"),  # UETrack 仓库 (Phase 2)
+        ("lie_detector", "hybrid", "uetrack", "ckpt_path"),  # UETrack 权重
     ]
-    for section, key in path_keys:
-        if section in cfg and key in cfg[section]:
-            p = Path(cfg[section][key])
-            if not p.is_absolute():
-                cfg[section][key] = str(PROJECT_ROOT / p)
+    for keys in path_keys:
+        node = cfg
+        for k in keys[:-1]:
+            if isinstance(node, dict) and k in node:
+                node = node[k]
+            else:
+                node = None
+                break
+        if node is None or keys[-1] not in node:
+            continue
+        p = Path(node[keys[-1]])
+        if not p.is_absolute():
+            node[keys[-1]] = str(PROJECT_ROOT / p)
 
 
 def reload() -> dict:
