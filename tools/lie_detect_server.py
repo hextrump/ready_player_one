@@ -30,6 +30,9 @@ import os
 import sys
 import threading
 import time
+import http.server
+import socket
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
@@ -208,6 +211,22 @@ class _ServerState:
         self._activated_at = 0.0
 
 
+class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """http.server + TCP_NODELAY (Windows 默认 delayed-ACK 40ms, Nagle 会让每请求慢 ~60ms)。
+
+    客户端 http.client 已设 NODELAY; 服务端收的连接默认没设 → 补上, 削掉小请求 RTT。
+    """
+    daemon_threads = True
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        return sock, addr
+
+
 # 模块级共享状态 (handler 引用)
 _STATE: Optional[_ServerState] = None
 
@@ -362,8 +381,7 @@ def main() -> None:
                           timeout_sec=args.timeout_sec)
     _STATE.warm_async()
 
-    server = ThreadingHTTPServer((args.host, args.port), _Handler)
-    server.daemon_threads = True
+    server = _Server((args.host, args.port), _Handler)
     print(f"[server] listening on {args.host}:{args.port}")
     try:
         server.serve_forever()
