@@ -159,7 +159,8 @@ class SamuraiStream:
             model_abs = str(samurai_repo / self.MODEL_PATHS[self._model_size])
             extra = []
             if self._requested_image_size:
-                extra.append(f"++model.image_size=[{self._requested_image_size},{self._requested_image_size}]")
+                # config 的 image_size 是标量 (如 1024), 保持标量 (list 会让 //16 崩溃)
+                extra.append(f"++model.image_size={self._requested_image_size}")
             self._predictor = build_sam2_video_predictor(
                 config_name, model_abs, device="cuda:0", hydra_overrides_extra=extra,
             )
