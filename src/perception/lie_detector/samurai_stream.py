@@ -27,6 +27,7 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+import torch
 
 from src.utils.logger import get_logger
 
