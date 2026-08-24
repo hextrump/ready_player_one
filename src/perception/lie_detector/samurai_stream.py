@@ -13,10 +13,10 @@ _run_single_frame_inference 推进一步 — SAM2 记忆库正常续跟。
     center, conf = ss.step(frame_bgr)      # 后续每帧推进 → ((cx,cy), confidence)
     ss.stop()                              # 结束会话, 释放 state/显存 (predictor 复用)
 
-config 路径: hhh 服务端 vendored sam2 是官方 SAM2.1 (无 SAMURAI 改动,
-`configs/samurai/` 目录为空)。用官方配置 `configs/sam2.1/sam2.1_hiera_<size>.yaml`;
+config 路径: 权重在 `samurai_repo/sam2/checkpoints/` (相对 samurai_repo 多一层 sam2);
 config_name 相对 hydra 搜索根 (= sam2 包目录 `samurai_repo/sam2/sam2`),
-权重在 `samurai_repo/sam2/checkpoints/` (多一层 sam2)。
+用 SAMURAI 的 `configs/samurai/sam2.1_hiera_<size>.yaml`
+(与官方 `configs/sam2.1/` 配置内容相同, demo.py 昨天实测跑通)。
 """
 from __future__ import annotations
 
@@ -53,12 +53,12 @@ class SamuraiStream:
         "large":     "sam2/checkpoints/sam2.1_hiera_large.pt",
     }
     # config_name 相对 hydra 搜索根 = sam2 包目录 (samurai_repo/sam2/sam2);
-    # vendored sam2 是官方 SAM2.1, 用 configs/sam2.1/ 官方配置
+    # 用 SAMURAI 的 configs/samurai/ 配置 (与 configs/sam2.1/ 官方配置同内容, 昨天实测跑通)
     CONFIG_PATHS = {
-        "tiny":      "configs/sam2.1/sam2.1_hiera_t.yaml",
-        "small":     "configs/sam2.1/sam2.1_hiera_s.yaml",
-        "base_plus": "configs/sam2.1/sam2.1_hiera_b+.yaml",
-        "large":     "configs/sam2.1/sam2.1_hiera_l.yaml",
+        "tiny":      "configs/samurai/sam2.1_hiera_t.yaml",
+        "small":     "configs/samurai/sam2.1_hiera_s.yaml",
+        "base_plus": "configs/samurai/sam2.1_hiera_b+.yaml",
+        "large":     "configs/samurai/sam2.1_hiera_l.yaml",
     }
 
     def __init__(self, detector_repo_path: str | Path, model_size: str = DEFAULT_MODEL_SIZE):
