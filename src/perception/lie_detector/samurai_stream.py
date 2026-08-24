@@ -181,7 +181,7 @@ class SamuraiStream:
             H, W = frame_bgr.shape[:2]
             t0 = self._preprocess(frame_bgr)          # CHW, CPU (offload)
             self._state = self._build_state(H, W, self._device, images=[t0])
-            with torch.inference_mode():
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                 # 同 init_state: 预热 frame 0 特征 → 喂 box → 收拢 cond 帧
                 self._predictor._get_image_feature(self._state, frame_idx=0, batch_size=1)
                 self._predictor.add_new_points_or_box(self._state, box=bbox, frame_idx=0, obj_id=0)
@@ -207,7 +207,7 @@ class SamuraiStream:
             self._state["images"].append(self._preprocess(frame_bgr))
             self._state["num_frames"] += 1
             output_dict = self._state["output_dict"]
-            with torch.inference_mode():
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                 current_out, pred_masks = self._predictor._run_single_frame_inference(
                     inference_state=self._state,
                     output_dict=output_dict,
