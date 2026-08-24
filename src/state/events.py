@@ -44,6 +44,10 @@ class EventType(str, Enum):
     INVENTORY_FULL = "inventory_full"
     PLAYER_DEAD = "player_dead"
 
+    # ── 测谎仪 (LIE DETECTOR) 反挂机 ──
+    LIE_DETECTOR_ACTIVE = "lie_detector_active"     # 检测到测谎仪 → 暂停战斗, 启动鼠标追踪
+    LIE_DETECTOR_CLEARED = "lie_detector_cleared"   # 测谎仪结束 → 恢复战斗
+
     # ── 系统 ──
     STATE_CHANGED = "state_changed"
     ACTION_COMPLETED = "action_completed"

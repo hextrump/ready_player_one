@@ -226,6 +226,16 @@ class WorldSnapshot:
     fps: float                    # 感知线程帧率
     world_offset: tuple = (0, 0)  # 相机位姿: world = screen + offset
 
+    # ── 测谎仪 (LIE DETECTOR, 设计文档 §方案 1+3) ──
+    # 视觉线程每帧把 LieDetectResult 写入 self.world, snapshot 冻结时值拷贝。
+    # 决策层 _decide 看到 lie_active=True → 最高优先级返回 ("lie_detector", None)。
+    lie_active: bool = False
+    lie_target_center: tuple | None = None    # (cx, cy) in letterbox 帧坐标
+    lie_target_bbox: tuple | None = None     # (x1, y1, x2, y2)
+    lie_confidence: float = 0.0              # [0, 1]
+    lie_brightness: float = 0.0              # [0, 255]
+    lie_phase: str = "idle"                  # idle / countdown / tracking
+
     # ── 世界坐标 ──
     # 相机跟着玩家走, 所以**屏幕坐标里玩家几乎不动** —— 想表达"走到那边那个平台的尽头"
     # 这种跨屏幕的目标, 必须用世界坐标, 否则目标点会随着镜头一起跑, 永远追不到。
@@ -279,6 +289,14 @@ class WorldState:
     seq: int = 0                                    # 感知帧序号
     world_offset: tuple = (0, 0)                    # 相机位姿 (world = screen + offset)
 
+    # ── 测谎仪 (视觉线程单写, 决策线程只读) ──
+    lie_active: bool = False
+    lie_target_center: tuple | None = None
+    lie_target_bbox: tuple | None = None
+    lie_confidence: float = 0.0
+    lie_brightness: float = 0.0
+    lie_phase: str = "idle"
+
     @property
     def targets(self) -> List[Monster]:
         """决策可消费的怪: **已确认** 且 漏检不超过 COAST_FRAMES 帧。
@@ -317,6 +335,12 @@ class WorldState:
             motion=self.motion,
             fps=self.fps,
             world_offset=tuple(self.world_offset),
+            lie_active=self.lie_active,
+            lie_target_center=self.lie_target_center,
+            lie_target_bbox=self.lie_target_bbox,
+            lie_confidence=self.lie_confidence,
+            lie_brightness=self.lie_brightness,
+            lie_phase=self.lie_phase,
         )
 
 

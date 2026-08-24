@@ -315,6 +315,33 @@ class GameController:
                 pass
         self._detach()
 
+    # ── 鼠标控制 (测谎仪追踪用, 设计文档 §2) ──
+
+    def client_to_screen(self, cx: int, cy: int) -> tuple[int, int]:
+        """客户区坐标 → 屏幕坐标 (win32gui.ClientToScreen)。"""
+        if not self._hwnd:
+            return (cx, cy)
+        try:
+            ox, oy = win32gui.ClientToScreen(self._hwnd, (0, 0))
+            return (ox + cx, oy + cy)
+        except Exception as e:
+            log.debug(f"[mouse] ClientToScreen 失败: {e}")
+            return (cx, cy)
+
+    def set_cursor_pos(self, sx: int, sy: int) -> None:
+        """移动系统光标到屏幕坐标 (win32api.SetCursorPos)。"""
+        try:
+            win32api.SetCursorPos((int(sx), int(sy)))
+        except Exception as e:
+            log.debug(f"[mouse] SetCursorPos 失败: {e}")
+
+    def get_cursor_pos(self) -> tuple[int, int]:
+        """读取当前系统光标位置。"""
+        try:
+            return win32api.GetCursorPos()
+        except Exception:
+            return (0, 0)
+
     # ── 内部 ──
 
     def _jitter(self) -> float:

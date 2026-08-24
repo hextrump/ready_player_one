@@ -96,6 +96,11 @@ class WindowCapture:
         self._width: int = 0
         self._height: int = 0
 
+        # 最近一次 letterbox 参数 (测谎仪坐标映射需要: letterbox 坐标 → 客户区坐标)
+        # 未启用 letterbox 时 = (1.0, 0, 0)。
+        self._last_letterbox: tuple[float, int, int] = (1.0, 0, 0)
+        self._last_letterbox_lock = threading.Lock()
+
         # 小地图区域 (相对于客户区，左上角)
         self._minimap_region: tuple[int, int, int, int] = (0, 0, 200, 150)
         self._lock = threading.Lock()
@@ -244,7 +249,12 @@ class WindowCapture:
                             title_h = max(0, h - ch)  # 标题栏高度
                             client_frame = bgr[title_h:title_h + ch, 0:cw]
                             if self.target_size is not None:
-                                client_frame, _, _, _ = letterbox_array(client_frame, self.target_size)
+                                client_frame, scale, pl, pt = letterbox_array(client_frame, self.target_size)
+                                with self._last_letterbox_lock:
+                                    self._last_letterbox = (scale, pl, pt)
+                            else:
+                                with self._last_letterbox_lock:
+                                    self._last_letterbox = (1.0, 0, 0)
                             return client_frame
                     except Exception as e:
                         log.warning(f"DXGI 帧处理失败, 回退 PrintWindow/BitBlt: {e}")
@@ -340,9 +350,14 @@ class WindowCapture:
 
             # letterbox 到规范尺寸 (与训练集一致)
             if self.target_size is not None:
-                client_frame, _, _, _ = letterbox_array(
+                client_frame, scale, pl, pt = letterbox_array(
                     client_frame, self.target_size
                 )
+                with self._last_letterbox_lock:
+                    self._last_letterbox = (scale, pl, pt)
+            else:
+                with self._last_letterbox_lock:
+                    self._last_letterbox = (1.0, 0, 0)
 
             return client_frame
 
@@ -456,3 +471,17 @@ class WindowCapture:
     @property
     def is_valid(self) -> bool:
         return self._hwnd != 0 and win32gui.IsWindow(self._hwnd)
+
+    @property
+    def last_letterbox(self) -> tuple[float, int, int]:
+        """最近一次 letterbox 参数 (scale, pad_left, pad_top)。
+
+        用于把视觉坐标 (letterbox 后) 映射回客户区坐标:
+            client_x = (letterbox_x - pad_left) / scale
+            client_y = (letterbox_y - pad_top) / scale
+        然后再 ClientToScreen(hwnd, ...) → 屏幕坐标 → SetCursorPos。
+
+        未启用 letterbox (target_size=None) 时返回 (1.0, 0, 0)。
+        """
+        with self._last_letterbox_lock:
+            return self._last_letterbox

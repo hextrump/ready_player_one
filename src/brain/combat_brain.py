@@ -38,12 +38,17 @@ from src.brain.patrol_mover import PatrolMover, MoveKind
 from src.brain.action_executor import ActionExecutor
 from src.brain.entity_tracker import (WorldState, MonsterTracker, PlayerState, TerrainTracker,
                                       PlayerConfidence, WorldSnapshot)
+from src.brain.human_mouse import HumanMouseConfig
+from src.brain.mouse_tracker import AdaptiveSpeedConfig, MouseTracker
 from src.perception.hp_monitor import HPMonitor
+from src.perception.lie_detector import LieDetectorModel
 from src.brain.data_collector import DataCollector
 from src.perception.nametag_hsv_locator import NametagHSVLocator, NAMETAG_SCORE_OK_THRESHOLD as NAMETAG_MATCH_THRESHOLD
+from src.state.events import EventType, GameEvent
 from src.state.ledger import BrainLedger
 from src.utils.logger import get_logger
 from src.utils.player_profile import get_profile
+from src.utils.config import load_config
 
 log = get_logger("combat_brain")
 
@@ -300,6 +305,17 @@ class CombatBrain:
                         f"只能靠 v13 身体几何/徽章配对 (多人同屏时容易认错人)。"
                         f" 采集: python tools/capture_nametag.py --player {p.template}")
 
+        # ── 测谎仪 (LIE DETECTOR) 鼠标追踪: 自动检测 + 自动跟随 ──
+        # 设计文档 §方案 1+3+8+9; 集成在视觉线程, 决策层最高优先级。
+        self._lie_detector: LieDetectorModel | None = None
+        self._mouse_tracker: MouseTracker | None = None
+        self._lie_active_logged = False   # 防激活日志刷屏
+        ld_cfg = load_config().get("lie_detector", {})
+        if ld_cfg.get("enabled", False):
+            self._init_lie_detector(ld_cfg)
+        else:
+            log.info("[LIE] lie_detector.enabled=false (配置关闭), 不初始化")
+
     def _perception_loop(self, capture: WindowCapture):
         """后台视觉线程：维持一秒看3-5次的高度警觉"""
         log.info("[VISION] 后台视觉线程已启动 (锁定 3-5 FPS)")
@@ -347,6 +363,25 @@ class CombatBrain:
                     w.motion = motion
                     w.fps = 1.0 / (time.time() - t0 + 0.001)
                     w.seq = self._frame_idx
+
+                    # ── 测谎仪检测 (独立通道; 与怪/地形互不影响) ──
+                    if self._lie_detector is not None:
+                        lie = self._lie_detector.update(frame)
+                        prev_active = w.lie_active
+                        w.lie_active = lie.active
+                        w.lie_target_center = lie.target_center if lie.active else None
+                        w.lie_target_bbox = lie.target_bbox if lie.active else None
+                        w.lie_confidence = lie.confidence
+                        w.lie_brightness = lie.brightness
+                        w.lie_phase = lie.phase.value if lie.phase else "idle"
+                        # 激活/解除时记日志 (不刷屏)
+                        if lie.active and not prev_active:
+                            log.info(f"[LIE] 测谎仪 ACTIVE  conf={lie.confidence:.2f} "
+                                     f"phase={w.lie_phase} target={lie.target_center}")
+                            self._lie_active_logged = True
+                        elif not lie.active and prev_active:
+                            log.info("[LIE] 测谎仪 CLEARED, 恢复战斗")
+                            self._lie_active_logged = False
 
                 # 定时心跳截图 (仅常规样本, 每 save_interval_seconds 秒一帧)
                 # 只挂机中采集; 按 F 停止 (active_hunting=False) 后不再自动截图
@@ -767,6 +802,14 @@ class CombatBrain:
             self._last_action = None
             return ("none", None)
 
+        # ── 测谎仪最高优先级: 一旦激活, 暂停一切战斗 ──
+        # 设计文档 §方案 4: 测谎期间停止打怪/接近/巡逻, 启动鼠标跟随。
+        # 用户按 F1/F 不影响测谎 (active_hunting 仍 True, 这里仅"暂停战斗动作")。
+        if snap.lie_active:
+            self.transition_to(BrainState.STANDBY, reason="测谎仪激活 (暂停战斗)")
+            self._last_action = ("lie_detector", None)
+            return ("lie_detector", None)
+
         # ── Watchdog: 状态超时强制升级 ──
         self._state_watchdog()
 
@@ -823,6 +866,93 @@ class CombatBrain:
         self.transition_to(BrainState.PATROLLING, reason="视野内无怪")
         self._last_action = ("patrol", None)
         return ("patrol", None)
+
+    # ── 测谎仪 (LIE DETECTOR) 集成 ──
+
+    def _init_lie_detector(self, ld_cfg: dict) -> None:
+        """从 config 初始化 LieDetectorModel + MouseTracker。失败不阻塞 bot。"""
+        repo = ld_cfg.get("detector_repo_path", "")
+        if not repo:
+            log.warning("[LIE] config.lie_detector.detector_repo_path 未配置, 跳过")
+            return
+        try:
+            self._lie_detector = LieDetectorModel(
+                detector_repo_path=repo,
+                backend=ld_cfg.get("backend", "opencv"),
+                config={
+                    "activate_after_frames": ld_cfg.get("activate_after_frames", 2),
+                    "deactivate_after_frames": ld_cfg.get("deactivate_after_frames", 6),
+                    "timeout_sec": ld_cfg.get("timeout_sec", 30.0),
+                },
+            )
+            # MouseTracker 需要 hwnd, run() 时再注入; 这里先存 cfg
+            self._mouse_tracker_cfg = {
+                "human_cfg": HumanMouseConfig.from_dict(ld_cfg.get("human_mouse")),
+                "speed_cfg": AdaptiveSpeedConfig.from_dict(ld_cfg.get("adaptive_speed")),
+            }
+            log.info(f"[LIE] 已初始化 (backend={self._lie_detector.backend.value})")
+        except Exception as e:
+            log.warning(f"[LIE] 初始化失败, 禁用: {e}", exc_info=True)
+            self._lie_detector = None
+
+    def _handle_lie_detector(self, controller: GameController,
+                             capture: WindowCapture, cancel) -> None:
+        """_action_worker 分支: 启动 MouseTracker (若未启), 喂目标, 阻塞到 lie_active 解除。
+
+        设计: 这里只负责"喂目标"和"等到结束"; 实际鼠标跟随由 MouseTracker 独立线程完成。
+        """
+        if self._lie_detector is None:
+            return
+
+        # 1. 确保 MouseTracker 已创建并启动
+        if self._mouse_tracker is None:
+            cfg = getattr(self, "_mouse_tracker_cfg", {})
+            try:
+                self._mouse_tracker = MouseTracker(
+                    hwnd=capture.hwnd,
+                    human_cfg=cfg.get("human_cfg"),
+                    speed_cfg=cfg.get("speed_cfg"),
+                )
+                self._mouse_tracker.start()
+                log.info("[LIE] MouseTracker 已启动")
+            except Exception as e:
+                log.warning(f"[LIE] MouseTracker 启动失败: {e}")
+                return
+
+        # 2. 测谎需要窗口前台 (游戏才能读到光标位置)
+        # 只在第一次调, 避免反复抢焦点触发反作弊
+        if not getattr(self, "_lie_brought_front", False):
+            try:
+                capture.bring_to_front()
+                self._lie_brought_front = True
+            except Exception as e:
+                log.debug(f"[LIE] bring_to_front 失败: {e}")
+
+        # 3. 循环喂目标 + 等待 lie_active 解除 (支持 cancel 中断)
+        while not cancel():
+            with self._vision_lock:
+                snap = self.world.snapshot()
+            if not snap.lie_active:
+                break
+            if snap.lie_target_center is not None:
+                scale, pad_l, pad_t = capture.last_letterbox
+                self._mouse_tracker.update_target(
+                    cx=snap.lie_target_center[0],
+                    cy=snap.lie_target_center[1],
+                    confidence=snap.lie_confidence,
+                    brightness=snap.lie_brightness,
+                    letterbox_scale=scale,
+                    letterbox_pad_left=pad_l,
+                    letterbox_pad_top=pad_t,
+                    hwnd=capture.hwnd,
+                )
+            time.sleep(0.05)  # 50ms 喂一次 (MouseTracker 内部按 Hz 走)
+
+        # 4. 退出循环 → 通知 mouse_tracker 清目标, 等下次激活再启动
+        if self._mouse_tracker is not None:
+            self._mouse_tracker.clear_target()
+        self._lie_brought_front = False
+        log.info("[LIE] MouseTracker 已退出跟随")
 
     def transition_to(self, new_state: BrainState, reason: str = "", force: bool = False) -> bool:
         """显式状态转换 (设计思想: 状态机账本化, 拒绝非法转换)。
@@ -942,6 +1072,9 @@ class CombatBrain:
                 # world_offset 与 platforms 同源 (同一份快照), 否则世界坐标换算会错位
                 self.mover.patrol(controller, px, py, platforms, ropes, self, cancel,
                                   world_offset=snap.world_offset)
+            elif atype == "lie_detector":
+                # 测谎仪动作: 启动 MouseTracker (若未启), 持续喂目标, 直到 lie_active=False
+                self._handle_lie_detector(controller, capture, cancel)
             # "none" 待机: 无需动作
         except Exception as e:
             log.error(f"[EXEC] 动作执行异常: {e}", exc_info=True)
@@ -1133,6 +1266,12 @@ class CombatBrain:
         if self.controller is not None:
             try:
                 self.controller.release_all_key()
+            except Exception:
+                pass
+        # 停止测谎仪 MouseTracker (释放鼠标跟随线程)
+        if getattr(self, '_mouse_tracker', None) is not None:
+            try:
+                self._mouse_tracker.stop()
             except Exception:
                 pass
         # 停止 DXGI 抓帧线程 (释放资源)

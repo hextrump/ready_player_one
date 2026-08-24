@@ -21,6 +21,17 @@ pyyaml>=6.0.1
 numpy>=1.24.0
 Pillow>=10.0.0
 
+# --- Lie Detector (LIE DETECTOR) 鼠标追踪 - SAMURAI/GPU 后端 (可选; opencv 后端不需要) ---
+# iopath 间接依赖; supervision/einops 是 sam2 推理需要
+# 没有 GPU 的机器仍可运行: lie_detector.backend=opencv 即可, 不强求安装
+tqdm>=4.66.0
+portalocker>=2.8.0
+supervision>=0.20.0
+einops>=0.7.0
+# PyTorch + SAM2.1 (samurai_repo/sam2 用); 已有 torch 即可, 否则下载较慢
+# torch>=2.1.0
+# sam2 (本地已通过 sys.path 注入 samurai_repo/sam2, 不需要 pip install)
+
 # --- Testing ---
 pytest>=7.4.0
 
