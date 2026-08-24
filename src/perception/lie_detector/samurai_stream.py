@@ -13,9 +13,10 @@ _run_single_frame_inference 推进一步 — SAM2 记忆库正常续跟。
     center, conf = ss.step(frame_bgr)      # 后续每帧推进 → ((cx,cy), confidence)
     ss.stop()                              # 结束会话, 释放 state/显存 (predictor 复用)
 
-config 路径修正: samurai_backend.py:144 的 CONFIG_PATHS 拼成
-`repo/samurai_repo/sam2/configs/samurai/...`, 实际在
-`repo/samurai_repo/sam2/sam2/configs/samurai/...` (少一层 sam2)。这里指正确位置。
+config 路径: hhh 服务端 vendored sam2 是官方 SAM2.1 (无 SAMURAI 改动,
+`configs/samurai/` 目录为空)。用官方配置 `configs/sam2.1/sam2.1_hiera_<size>.yaml`;
+config_name 相对 hydra 搜索根 (= sam2 包目录 `samurai_repo/sam2/sam2`),
+权重在 `samurai_repo/sam2/checkpoints/` (多一层 sam2)。
 """
 from __future__ import annotations
 
@@ -44,19 +45,20 @@ class SamuraiStream:
 
     DEFAULT_MODEL_SIZE = "base_plus"
 
-    # 模型 size → 权重 / 配置文件路径 (相对 samurai_repo/sam2)
+    # 模型 size → 权重路径 (相对 samurai_repo, 实际在 samurai_repo/sam2/checkpoints/)
     MODEL_PATHS = {
-        "tiny":      "checkpoints/sam2.1_hiera_tiny.pt",
-        "small":     "checkpoints/sam2.1_hiera_s.pt",
-        "base_plus": "checkpoints/sam2.1_hiera_base_plus.pt",
-        "large":     "checkpoints/sam2.1_hiera_large.pt",
+        "tiny":      "sam2/checkpoints/sam2.1_hiera_tiny.pt",
+        "small":     "sam2/checkpoints/sam2.1_hiera_s.pt",
+        "base_plus": "sam2/checkpoints/sam2.1_hiera_base_plus.pt",
+        "large":     "sam2/checkpoints/sam2.1_hiera_large.pt",
     }
-    # 注意: configs 实际在 samurai_repo/sam2/sam2/configs/samurai/ (内层多一层 sam2)
+    # config_name 相对 hydra 搜索根 = sam2 包目录 (samurai_repo/sam2/sam2);
+    # vendored sam2 是官方 SAM2.1, 用 configs/sam2.1/ 官方配置
     CONFIG_PATHS = {
-        "tiny":      "sam2/configs/samurai/sam2.1_hiera_t.yaml",
-        "small":     "sam2/configs/samurai/sam2.1_hiera_s.yaml",
-        "base_plus": "sam2/configs/samurai/sam2.1_hiera_b+.yaml",
-        "large":     "sam2/configs/samurai/sam2.1_hiera_l.yaml",
+        "tiny":      "configs/sam2.1/sam2.1_hiera_t.yaml",
+        "small":     "configs/sam2.1/sam2.1_hiera_s.yaml",
+        "base_plus": "configs/sam2.1/sam2.1_hiera_b+.yaml",
+        "large":     "configs/sam2.1/sam2.1_hiera_l.yaml",
     }
 
     def __init__(self, detector_repo_path: str | Path, model_size: str = DEFAULT_MODEL_SIZE):
@@ -105,9 +107,10 @@ class SamuraiStream:
             self._import_error = FileNotFoundError(f"模型权重缺失: {model_abs}")
             log.warning(f"[samurai_stream] {self._import_error}")
             return
-        config_abs = samurai_repo / self.CONFIG_PATHS[self._model_size]
+        # config 是 hydra 相对名; 文件在 sam2 包目录下 samurai_repo/sam2/sam2/configs/...
+        config_abs = samurai_repo / "sam2" / "sam2" / self.CONFIG_PATHS[self._model_size]
         if not config_abs.is_file():
-            self._import_error = FileNotFoundError(f"samurai config 缺失: {config_abs}")
+            self._import_error = FileNotFoundError(f"sam2 config 缺失: {config_abs}")
             log.warning(f"[samurai_stream] {self._import_error}")
             return
 
@@ -148,9 +151,10 @@ class SamuraiStream:
             from sam2.build_sam import build_sam2_video_predictor  # type: ignore
 
             samurai_repo = self._repo_path / "samurai_repo"
-            config_abs = str(samurai_repo / self.CONFIG_PATHS[self._model_size])
+            # hydra 已由 import sam2 初始化为包目录搜索根 → 传相对 config_name (非绝对路径)
+            config_name = self.CONFIG_PATHS[self._model_size]
             model_abs = str(samurai_repo / self.MODEL_PATHS[self._model_size])
-            self._predictor = build_sam2_video_predictor(config_abs, model_abs, device="cuda:0")
+            self._predictor = build_sam2_video_predictor(config_name, model_abs, device="cuda:0")
             self._device = torch.device("cuda:0")
             size = self._predictor.image_size
             self._image_size = int(size[0]) if isinstance(size, (tuple, list)) else int(size)
