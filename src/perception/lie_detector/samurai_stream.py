@@ -62,9 +62,11 @@ class SamuraiStream:
         "large":     "configs/samurai/sam2.1_hiera_l.yaml",
     }
 
-    def __init__(self, detector_repo_path: str | Path, model_size: str = DEFAULT_MODEL_SIZE):
+    def __init__(self, detector_repo_path: str | Path, model_size: str = DEFAULT_MODEL_SIZE,
+                 image_size: int | None = None):
         self._repo_path = Path(detector_repo_path)
         self._model_size = model_size
+        self._requested_image_size = image_size  # None = 用配置默认 (1024); 512 可省 ~4x 算力
         self._imported = False
         self._import_error: Optional[Exception] = None
         self._build_error: Optional[Exception] = None
@@ -155,7 +157,12 @@ class SamuraiStream:
             # hydra 已由 import sam2 初始化为包目录搜索根 → 传相对 config_name (非绝对路径)
             config_name = self.CONFIG_PATHS[self._model_size]
             model_abs = str(samurai_repo / self.MODEL_PATHS[self._model_size])
-            self._predictor = build_sam2_video_predictor(config_name, model_abs, device="cuda:0")
+            extra = []
+            if self._requested_image_size:
+                extra.append(f"++model.image_size=[{self._requested_image_size},{self._requested_image_size}]")
+            self._predictor = build_sam2_video_predictor(
+                config_name, model_abs, device="cuda:0", hydra_overrides_extra=extra,
+            )
             self._device = torch.device("cuda:0")
             size = self._predictor.image_size
             self._image_size = int(size[0]) if isinstance(size, (tuple, list)) else int(size)

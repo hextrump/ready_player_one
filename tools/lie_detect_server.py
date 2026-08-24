@@ -52,6 +52,7 @@ class _ServerState:
         self,
         repo: str | Path,
         model_size: str,
+        image_size: int | None = None,
         activate_after: int = 2,
         deactivate_after: int = 6,
         timeout_sec: float = 30.0,
@@ -65,7 +66,7 @@ class _ServerState:
 
         self._repo = Path(repo)
         self.opencv = OpenCVBackend(self._repo)
-        self.samurai = SamuraiStream(self._repo, model_size=model_size)
+        self.samurai = SamuraiStream(self._repo, model_size=model_size, image_size=image_size)
         self._debounce = _DebounceState(
             activate_after=activate_after,
             deactivate_after=deactivate_after,
@@ -282,10 +283,10 @@ def _synthetic_frame(step: int = 0) -> np.ndarray:
     return frame
 
 
-def _spike(repo: str | Path, model_size: str) -> int:
+def _spike(repo: str | Path, model_size: str, image_size: int | None = None) -> int:
     """部署门禁: 构建 predictor + 合成帧 init/step, 测 GPU 延迟。"""
-    print(f"[spike] repo={repo} model={model_size}")
-    state = _ServerState(repo, model_size)
+    print(f"[spike] repo={repo} model={model_size} image_size={image_size or 'cfg'}")
+    state = _ServerState(repo, model_size, image_size=image_size)
     print(f"[spike] opencv.ready={state.opencv.ready} samurai.ready={state.samurai.ready}")
     if not state.samurai.ready:
         print(f"[spike] 失败: {state.samurai.import_error}", file=sys.stderr)
@@ -329,6 +330,8 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8600)
     ap.add_argument("--repo", default=None, help="lie-detector 项目路径 (默认 hhh 独立项目)")
     ap.add_argument("--model-size", default="base_plus")
+    ap.add_argument("--image-size", type=int, default=None,
+                    help="SAM2 输入边长 (默认配置 1024; 512 更快但精度降)")
     ap.add_argument("--gpu", default="0", help="CUDA_VISIBLE_DEVICES (import torch 前生效)")
     ap.add_argument("--activate-after", type=int, default=2)
     ap.add_argument("--deactivate-after", type=int, default=6)
@@ -349,10 +352,10 @@ def main() -> None:
     print(f"[server] repo={repo} (存在: {Path(repo).is_dir()})")
 
     if args.spike:
-        sys.exit(_spike(repo, args.model_size))
+        sys.exit(_spike(repo, args.model_size, args.image_size))
 
     global _STATE
-    _STATE = _ServerState(repo, args.model_size,
+    _STATE = _ServerState(repo, args.model_size, image_size=args.image_size,
                           activate_after=args.activate_after,
                           deactivate_after=args.deactivate_after,
                           timeout_sec=args.timeout_sec)
