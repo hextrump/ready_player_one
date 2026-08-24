@@ -318,7 +318,7 @@ def _spike(repo: str | Path, model_size: str, image_size: int | None = None) -> 
         dt = (time.perf_counter() - t0) * 1000
         lat.append(dt)
         print(f"[spike] step{i}: {res} ({dt:.0f}ms)")
-    avg_ms = float(np.mean(lat)) * 1000
+    avg_ms = float(np.mean(lat))  # lat 已是 ms
     print(f"[spike] step 平均 {avg_ms:.0f}ms/帧 ({'PASS <50ms' if avg_ms < 50 else 'FAIL >=50ms'})")
     state.samurai.stop()
     return 0 if avg_ms < 50 else 1
