@@ -108,6 +108,7 @@ class _ServerState:
         self._last_center: Optional[Tuple[int, int]] = None   # 最近一次已接受的目标中心 (空间门/hold)
         self._last_phase: Optional[LiePhase] = None           # 上一帧阶段 (countdown 首帧 = 新事件)
         self._countdown_stable = 0                            # countdown 连续稳定帧计数 (预热 samurai 用)
+        self._seen_tracking = False                           # 本事件内是否见过 TRACKING (相位单调性, P2)
         self._device: Optional[str] = None
 
         if not self.opencv.ready:
@@ -218,12 +219,32 @@ class _ServerState:
         conf = r.confidence
         s_bbox = None
         bbox_out = None
+        accepted = False
+
+        # diag: 每帧诊断 (客户端 remote_backend._parse_result 只读已知键, 未知键忽略, 安全)
+        diag = {
+            "oc": None if r.target_center is None else [int(r.target_center[0]), int(r.target_center[1])],
+            "ob": None if r.target_bbox is None else [int(v) for v in r.target_bbox],
+            "matched": int(round(r.confidence * 4)),
+            "phase_raw": r.phase.value,
+            "new_event": new_event,
+            "miss_run": miss_run,
+            "anchor": None if self._last_center is None else list(self._last_center),
+            "branch": None,
+            "rejected": False,
+            "sam_center": None,
+            "sam_conf": None,
+            "anchor_guard": False,
+            "cd_stable": self._countdown_stable,
+            "seen_tracking": self._seen_tracking,
+        }
 
         if r.phase == LiePhase.COUNTDOWN:
             # 倒计时: 星形静止, opencv 权威, 强空间门 (距离门对置信无豁免 — 星形不会跳)
             center, accepted = self._gate_center(r.target_center, r.confidence, COUNTDOWN_GATE_DIST,
                                                  conf_bypass=False)
             bbox_out = r.target_bbox if accepted else None
+            diag["branch"] = "countdown"
             # 预热 samurai: countdown 星形静止且较亮, 连续稳定后起会话 (tracking 进入即有 mask)
             if not self.samurai.session_active and accepted and r.target_bbox is not None:
                 self._countdown_stable += 1
@@ -244,6 +265,7 @@ class _ServerState:
                 if r.target_bbox is not None and self._anchoring_ok(r, new_event):
                     started = self.samurai.start(frame_bgr, tuple(int(v) for v in r.target_bbox))
             if started:
+                diag["branch"] = "tracking_start"
                 center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
                 conf = r.confidence
                 bbox_out = r.target_bbox if accepted else None
@@ -251,12 +273,17 @@ class _ServerState:
                 res = self.samurai.step(frame_bgr)
                 if res is not None:
                     s_center, s_conf, s_bbox = res
+                    diag["sam_center"] = [int(s_center[0]), int(s_center[1])]
+                    diag["sam_conf"] = round(float(s_conf), 4)
                     # 锚点守卫: opencv 强检测且分歧大 → 信 opencv (并清掉 samurai 框)
-                    if (
+                    guard = (
                         r.target_center is not None
                         and r.confidence >= ANCHOR_GUARD_MIN_CONF
                         and np.hypot(s_center[0] - r.target_center[0], s_center[1] - r.target_center[1]) > ANCHOR_GUARD_DIST
-                    ):
+                    )
+                    diag["anchor_guard"] = guard
+                    diag["branch"] = "samurai_step"
+                    if guard:
                         center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
                         conf = r.confidence
                     else:
@@ -264,6 +291,7 @@ class _ServerState:
                         conf = s_conf
                 else:
                     # step 失败 (目标消失) → 回退 opencv (过门)
+                    diag["branch"] = "samurai_fail"
                     center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
                 if not accepted:
                     s_bbox = None
@@ -271,12 +299,17 @@ class _ServerState:
                 self._track_count += 1
             else:
                 # 会话未起 (门禁拦下) → opencv 输出 (过门)
+                diag["branch"] = "opencv_nosession"
                 center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
                 bbox_out = r.target_bbox if accepted else None
         else:
             # 激活中但 opencv miss (去抖未解除) → 无目标, 客户端 hold
+            diag["branch"] = "hold_none"
             center, accepted = None, False
 
+        diag["rejected"] = not accepted
+        if r.phase == LiePhase.TRACKING and r.active:
+            self._seen_tracking = True
         self._last_phase = r.phase
 
         return {
@@ -287,6 +320,7 @@ class _ServerState:
             "confidence": round(float(conf), 4),
             "bbox": None if bbox_out is None else [int(v) for v in bbox_out],
             "s_bbox": None if s_bbox is None else [int(v) for v in s_bbox],
+            "diag": diag,
         }
 
     def _update_debounce(self, candidate_active: bool, now: float) -> bool:
@@ -310,6 +344,7 @@ class _ServerState:
         self._last_center = None
         self._last_phase = None
         self._countdown_stable = 0
+        self._seen_tracking = False
 
     # ── 事件生命周期 + 空间门 helper ──
 
@@ -329,6 +364,7 @@ class _ServerState:
         self._last_center = None
         self._last_phase = None
         self._countdown_stable = 0
+        self._seen_tracking = False
         if stopped:
             print(f"[server] 会话结束 ({reason or '事件结束'})", file=sys.stderr)
 

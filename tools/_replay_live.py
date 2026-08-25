@@ -10,6 +10,12 @@
 
 用法:
   python tools/_replay_live.py <video> [--out <json>] [--fps N] [--host H] [--port P]
+
+保真度 (重要): 生产抓帧是 WindowCapture 默认 letterbox 到 CANONICAL_SIZE (1366,768),
+服务端看到的是 1366x768 画布帧, 距离门/尺寸门都是绝对 px。直接 POST 原生视频帧会让
+replay 与生产几何不一致 (1280x720 好视频在 replay 星形比生产大 1.33x, 744x480 坏视频
+反而小), 这是"replay 全 PASS、实机仍歪"的最可能原因。本工具默认把每帧
+letterbox_array(frame, (1366,768)) 后再 POST, 逐帧复刻生产几何。
 """
 from __future__ import annotations
 
@@ -24,15 +30,26 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.utils.image_utils import letterbox_array  # noqa: E402  生产同款 letterbox
+
+# 生产 WindowCapture CANONICAL_SIZE (src/capture/window_capture.py)
+CANVAS_W, CANVAS_H = 1366, 768
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("video")
     ap.add_argument("--out", default="")
-    ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--fps", type=int, default=5,
+                    help="喂帧节奏 (默认 5, 匹配生产视觉线程 3-5fps; 旧默认 30 会让 miss/稳定计数失真)")
     ap.add_argument("--host", default="100.118.47.94")
     ap.add_argument("--port", type=int, default=8600)
     ap.add_argument("--max-frames", type=int, default=0)
+    ap.add_argument("--canvas-w", type=int, default=CANVAS_W)
+    ap.add_argument("--canvas-h", type=int, default=CANVAS_H)
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -50,6 +67,8 @@ def main() -> int:
             break
         if args.max_frames and idx >= args.max_frames:
             break
+        # 保真: 复刻生产 WindowCapture 几何 — 原生帧 letterbox 到 (1366,768) 灰底画布
+        frame, _scale, _pad_l, _pad_t = letterbox_array(frame, (args.canvas_w, args.canvas_h))
         # 节奏: 模拟实时喂帧
         now = time.time()
         if t_prev is not None and args.fps > 0:
@@ -78,6 +97,7 @@ def main() -> int:
             "center": data.get("center"),
             "bbox": data.get("bbox"),
             "s_bbox": data.get("s_bbox"),
+            "diag": data.get("diag"),
         })
         idx += 1
     cap.release()
@@ -140,6 +160,66 @@ def analyze(rows) -> None:
     if tj:
         print(f"tracking 中心跳>60px: {len(tj)}次 最大={max(j for _, j in tj)}px")
         print("  前10:", tj[:10])
+
+    # ---- diag 分类: 每个被接受 (>120px) teleport 按 diag 指纹归类 ----
+    teleports = []
+    prev_c = None
+    prev_area = None
+    for r in act:
+        c = r.get("center")
+        d = r.get("diag") or {}
+        if not c:
+            prev_c = None
+            prev_area = None
+            continue
+        tags = []
+        if prev_c is not None:
+            dist = float(np.hypot(c[0] - prev_c[0], c[1] - prev_c[1]))
+            if dist > 120:
+                if d.get("new_event"):
+                    tags.append("new_event")
+                if d.get("anchor_guard"):
+                    tags.append("anchor_guard")
+                if (d.get("miss_run") or 0) < 2 and not d.get("new_event"):
+                    tags.append("mid_event")
+                # 尺寸异常: 被接受 bbox 面积 vs 上一被接受面积
+                bbox = d.get("ob") or r.get("bbox")
+                if bbox and prev_area:
+                    area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                    if prev_area > 0 and area / prev_area > 4:
+                        tags.append(f"size_x{area / prev_area:.0f}")
+                teleports.append({
+                    "idx": r["idx"], "dist": round(dist), "tags": ",".join(tags) or "-",
+                    "branch": d.get("branch"), "phase_raw": d.get("phase_raw"),
+                    "conf": round(float(r.get("conf") or 0), 2),
+                    "sam_conf": d.get("sam_conf"),
+                })
+        if c:
+            prev_c = c
+            bbox = d.get("ob") or r.get("bbox")
+            if bbox:
+                prev_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+    if teleports:
+        print(f"\n=== 被接受 teleport (>120px) x{len(teleports)} ===")
+        for t in teleports:
+            print(f"  idx={t['idx']} dist={t['dist']}px {t['tags']}  branch={t['branch']} "
+                  f"phase_raw={t['phase_raw']} conf={t['conf']} sam_conf={t['sam_conf']}")
+    else:
+        print("\n被接受 teleport (>120px): 0次")
+
+    # ---- bbox 面积分布 (校准 SIZE_GATE_FACTOR: 星形 vs 数字) ----
+    areas = []
+    for r in act:
+        d = r.get("diag") or {}
+        bbox = d.get("ob") or r.get("bbox")
+        if bbox:
+            areas.append((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+    if areas:
+        s = sorted(areas)
+        n2 = len(s)
+        q = lambda p: s[min(n2 - 1, int(n2 * p))]
+        print(f"opencv bbox 面积分布 (accepted帧, n={n2}): p10={q(0.1):.0f} "
+              f"p50={q(0.5):.0f} p90={q(0.9):.0f} max={s[-1]:.0f}")
 
 
 if __name__ == "__main__":
