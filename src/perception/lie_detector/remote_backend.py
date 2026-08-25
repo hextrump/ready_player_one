@@ -9,7 +9,8 @@ bot 侧薄客户端: 每帧 JPEG → POST hhh 服务 /frame → 解析 JSON 构�
     r = rb.update(frame)          # → LieDetectResult
     rb.close()
 
-失败降级: 任何网络异常/超时/非 200 → LieDetectResult(active=False) (检测不到不移鼠标)。
+失败降级: 任何网络异常/超时/非 200 → 先"保活"最近 0.6s 内的 active 结果 (stale=True,
+鼠标不因网络抖动闪断), 超过窗口才 LieDetectResult(active=False)。
 keep-alive: 持一个 HTTPConnection 跨请求复用; 断连重建一次再试。
 可选 fallback: 传一个 callable(frame)->LieDetectResult (如本地 OpenCVBackend.detect),
 远程失败时兜底 (config fallback=opencv 才启用, 默认关 — 遵"全远程")。
@@ -21,6 +22,7 @@ import http.client
 import json
 import socket
 import time
+from dataclasses import replace
 from typing import Callable, Optional, Tuple
 
 import cv2
@@ -52,6 +54,10 @@ class RemoteBackend:
         self._conn = None
         self._cooldown_until = 0.0      # 断连冷却: 期间不发请求 (outage 不拖垮视觉线程)
         self._cooldown = 0.8            # 秒; 冷却窗口内不再尝试连接
+        # 断网保活: 网络抖动时把最近一次 active 结果垫着返回 (stale=True), 鼠标不闪断
+        self._last_active: Optional[LieDetectResult] = None
+        self._last_active_t = 0.0
+        self._hold_last_sec = 0.6       # 超过此窗口的断网 → 才真正 inactive
 
     # ── 公共属性 ──
 
@@ -70,7 +76,16 @@ class RemoteBackend:
         """每帧调用: 发帧 → 收 {active, center, confidence} → LieDetectResult。"""
         result = self._request_frame(frame)
         if result is not None:
+            if result.active:
+                self._last_active = result
+                self._last_active_t = time.time()
             return result
+        # 远程失败 → 短暂保活上一帧激活目标 (网络抖动不闪断; 超过窗口才安全 inactive)
+        if (
+            self._last_active is not None
+            and (time.time() - self._last_active_t) < self._hold_last_sec
+        ):
+            return replace(self._last_active, stale=True)
         # 远程失败 → 可选本地兜底, 否则安全返回 inactive
         if self._fallback is not None:
             try:
@@ -176,6 +191,7 @@ class RemoteBackend:
         phase = RemoteBackend._parse_phase(data.get("phase"))
         center = RemoteBackend._to_tuple(data.get("center"))
         bbox = RemoteBackend._to_tuple(data.get("bbox"))
+        s_bbox = RemoteBackend._to_tuple(data.get("s_bbox"))
         return LieDetectResult(
             active=active,
             phase=phase,
@@ -184,6 +200,7 @@ class RemoteBackend:
             confidence=float(data.get("confidence", 0.0) or 0.0),
             brightness=float(data.get("brightness", 0.0) or 0.0),
             backend=LieBackend.REMOTE,
+            samurai_bbox=s_bbox,
         )
 
     @staticmethod

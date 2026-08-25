@@ -10,7 +10,7 @@ _run_single_frame_inference 推进一步 — SAM2 记忆库正常续跟。
     ss = SamuraiStream(repo_path)          # repo = lie-detector 项目 (samurai_repo 在其中)
     if ss.ready: ss.warm()                 # 启动一次性构建 predictor (~10-20s)
     ss.start(frame_bgr, bbox)              # 首帧 + opencv bbox → init SAM2 state
-    center, conf = ss.step(frame_bgr)      # 后续每帧推进 → ((cx,cy), confidence)
+    center, conf, mbox = ss.step(frame_bgr)  # 后续每帧推进 → ((cx,cy), confidence, mask_bbox)
     ss.stop()                              # 结束会话, 释放 state/显存 (predictor 复用)
 
 config 路径: 权重在 `samurai_repo/sam2/checkpoints/` (相对 samurai_repo 多一层 sam2);
@@ -202,10 +202,11 @@ class SamuraiStream:
             self._state = None
             return False
 
-    def step(self, frame_bgr: np.ndarray) -> Optional[Tuple[Tuple[int, int], float]]:
-        """推进一帧, 返回 ((cx, cy), confidence) 或 None (跟丢/异常)。
+    def step(self, frame_bgr: np.ndarray) -> Optional[Tuple[Tuple[int, int], float, Tuple[int, int, int, int]]]:
+        """推进一帧, 返回 ((cx, cy), confidence, mask_bbox) 或 None (跟丢/异常)。
 
-        center 在发送帧坐标空间 (mask 从 model-resize 回原分辨率)。
+        center/bbox 在发送帧坐标空间 (mask 从 model-resize 回原分辨率)。
+        bbox = mask 像素包络 (x1, y1, x2, y2), 客户端画跟踪框用 (≈昨天的遮罩轮廓)。
         """
         if not self._imported or self._predictor is None or self._state is None:
             return None
@@ -241,27 +242,29 @@ class SamuraiStream:
             if len(xs) == 0:
                 return None
             cx, cy = int(round(float(xs.mean()))), int(round(float(ys.mean())))
+            mbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
             obj_score = float(torch.sigmoid(current_out["object_score_logits"]).flatten()[0])
             self._next_idx = frame_idx + 1
-            return (cx, cy), obj_score
+            return (cx, cy), obj_score, mbox
         except Exception as e:
             log.warning(f"[samurai_stream] step 失败: {e}", exc_info=True)
             return None
 
     def stop(self) -> None:
-        """结束会话: 丢弃 state, 释放显存。predictor 保留复用。"""
+        """结束会话: 丢弃 state, 释放对象。predictor 保留复用, 显存缓存保留。
+
+        不再调用 cuda.empty_cache()/clear_autocast_cache(): 每次事件后清空显存缓存,
+        会让下一次 start 冷启动 2-25s (实测 warm 仅 537ms)。CUDA 分配器会把本会话
+        释放的块缓存复用, 峰值显存 = 单事件工作集 + predictor, 不随事件数增长。
+        """
         self._state = None
         self._next_idx = 0
         try:
             import gc
-            import torch
             gc.collect()
-            if torch.cuda.is_available():
-                torch.clear_autocast_cache()
-                torch.cuda.empty_cache()
         except Exception:
             pass
-        log.info("[samurai_stream] 会话已结束 (显存已释放)")
+        log.info("[samurai_stream] 会话已结束 (state 已释放, 显存缓存复用)")
 
     # ── inference_state 构造 (纯数据, 可无 GPU 单测) ──
 

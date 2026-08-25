@@ -76,6 +76,26 @@ def is_admin() -> bool:
         return False
 
 
+def process_integrity(pid: int) -> int | None:
+    """进程完整性级别数值 (S-1-16-xxxx 的 RID): 4096=low 8192=medium 12288=high; 失败返回 None。"""
+    try:
+        import win32security
+        h = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        try:
+            tok = win32security.OpenProcessToken(h, win32security.TOKEN_QUERY)
+            try:
+                data = win32security.GetTokenInformation(tok, win32security.TokenIntegrityLevel)
+                sid = data[0] if isinstance(data, tuple) else data
+                s = win32security.ConvertSidToStringSid(sid)
+                return int(s.rsplit("-", 1)[1])
+            finally:
+                tok.Close()
+        finally:
+            h.Close()
+    except Exception:
+        return None
+
+
 class Direction(str, Enum):
     LEFT = "left"
     RIGHT = "right"
@@ -116,6 +136,7 @@ class GameController:
         self._attached = False
         if hwnd:
             self._refresh_thread()
+        self._check_uipi()
 
     # ── 线程管理 ──
 
@@ -123,7 +144,30 @@ class GameController:
         """绑定目标窗口句柄。"""
         self._hwnd = hwnd
         self._refresh_thread()
+        self._check_uipi()
         log.info(f"控制器绑定后台窗口: hwnd=0x{hwnd:08X}, thread={self._game_thread}")
+
+    def _check_uipi(self) -> None:
+        """UIPI 自检: 游戏进程完整性 > 本进程 → 输入注入会被静默丢弃。
+
+        冒险岛客户端提权运行 (High)。若 bot 以普通权限启动 (Medium), UIPI 会把
+        SetCursorPos / SendInput / keybd_event 全部拦下 (SetCursorPos 返回 False,
+        SendInput 返回 1 但投递时被丢), 表现为"鼠标完全不动 / 键盘没反应"。
+        之前就是静默失败, 这里启动即报错, 一眼定位。
+        """
+        if not self._hwnd:
+            return
+        try:
+            game_pid = win32process.GetWindowThreadProcessId(self._hwnd)[1]
+        except Exception:
+            return
+        game = process_integrity(game_pid)
+        mine = process_integrity(win32api.GetCurrentProcessId())
+        if game is not None and mine is not None and game > mine:
+            log.error(
+                f"⚠️ UIPI 拦截! 游戏进程完整性({game}) > bot({mine}), "
+                f"SetCursorPos/SendInput/keybd_event 都会被静默丢弃 → 鼠标/键盘完全失效。"
+                f"请用 run_as_admin.bat / run_as_admin.py 以管理员身份启动。")
 
     def _refresh_thread(self) -> None:
         """刷新游戏窗口的线程 ID。"""

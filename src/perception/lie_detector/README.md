@@ -130,6 +130,7 @@ human_mouse.move_to(current_cursor, (screen_x, screen_y), duration_ms=120)
 
 ## 已知限制
 
+- **必须管理员运行 (UIPI)**：游戏客户端提权运行（High 完整性），bot 若普通权限启动（Medium），UIPI 会静默丢弃所有 `SetCursorPos`/`SendInput`/`keybd_event` 注入 → 鼠标完全不动、键盘没反应。**必须用 `run_as_admin.bat` / `run_as_admin.py` 以管理员启动**（`GameController` 已加启动自检，没提权会直接报 `UIPI 拦截` 错误）。实测: 同一探针 Medium 时 3/3 全失效, 提权后 3/3 全通过。
 - **沙色窗口检测**：实际游戏窗口是深灰/沙土浮雕，OpenCV 窗口检测常 FAILED → 自动回退全帧白块检测（实测工作）
 - **SAMURAI 移动阶段跟丢**：初始 bbox 太紧 + 倒计时→移动窗口布局剧变会丢目标 → 用更大初始 bbox + OpenCV 重检出触发 re-init 缓解
 - **目标渐隐后期精度**：OpenCV 后端在多阈值命中数降低时 bbox 漂移 → 配合 §9 自适应速度使用

@@ -35,6 +35,8 @@ class LieDetectResult:
     confidence: float = 0.0     # [0, 1] = 命中阈值数 / 总阈值数 (多阈值天然信号)
     brightness: float = 0.0     # 目标 ROI 平均亮度 [0, 255]
     backend: LieBackend = LieBackend.OPENCV
+    samurai_bbox: Optional[Tuple[int, int, int, int]] = None  # SAMURAI mask 跟踪框 (REMOTE 服务端返回; 有它时跟踪框优先画它)
+    stale: bool = False         # REMOTE: 网络抖动时返回的上一帧缓存 (让鼠标不闪断, 非实时)
 
 
 @dataclass

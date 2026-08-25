@@ -12,7 +12,8 @@
     GET  /health → {"status":"ok"|"building"|"error","model_ready":bool,"device":str,
                     "build_error":str|null,"session_active":bool,"track_count":int}
     POST /frame  {"image_b64":"<jpeg>"} → {"ok":true,"active":bool,"phase":"countdown"|"tracking",
-                    "center":[cx,cy]|null,"confidence":float,"bbox":[x1,y1,x2,y2]|null}
+                    "center":[cx,cy]|null,"confidence":float,"bbox":[x1,y1,x2,y2]|null,
+                    "s_bbox":[x1,y1,x2,y2]|null}   # s_bbox = SAMURAI mask 跟踪框 (无则画 bbox)
     POST /clear  → {"ok":true}   (强制结束会话, 释放 GPU)
 
 会话流式: 测谎事件内一个 SAM2 会话。
@@ -44,8 +45,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # 锚点守卫: opencv 置信 ≥ 此值 且 与 samurai 中心分歧 > 此值(px) → 信 opencv
-ANCHOR_GUARD_MIN_CONF = 0.5
+# 0.8 (不是 0.5): opencv 在 conf=0.5-0.7 (多阈值部分命中, 常见于弱/抖动检测) 时中心常漂移,
+# 若此时抢 samurai 会让鼠标满屏跳。只有 opencv 很强 (≥0.8, 接近 1.0) 才允许拽回。
+ANCHOR_GUARD_MIN_CONF = 0.8
 ANCHOR_GUARD_DIST = 120
+
+# opencv 检测降采样: 长边超过此值先把帧缩到该尺寸再检测 (连通域成本 ~O(像素数),
+# 全帧 150-400ms → 缩放后 ~100ms)。绝对阈值由 opencv_backend 按 scale 同步缩放,
+# 返回坐标已缩回全分辨率。
+DETECT_MAX_SIDE = 320
 
 
 class _ServerState:
@@ -130,7 +138,19 @@ class _ServerState:
     # ── 核心逐帧逻辑 ──
 
     def _handle_frame_locked(self, frame_bgr: np.ndarray) -> dict[str, Any]:
-        r = self.opencv.detect(frame_bgr)   # LieDetectResult (opencv 权威: 激活 + bbox + phase)
+        # opencv 降采样检测: 长边 > DETECT_MAX_SIDE → 缩放后检测 (阈值同步缩放, 结果缩回全分辨率)
+        detect_frame = frame_bgr
+        detect_scale = 1.0
+        H, W = frame_bgr.shape[:2]
+        max_side = max(H, W)
+        if max_side > DETECT_MAX_SIDE:
+            detect_scale = DETECT_MAX_SIDE / max_side
+            detect_frame = cv2.resize(
+                frame_bgr,
+                (max(1, int(round(W * detect_scale))), max(1, int(round(H * detect_scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        r = self.opencv.detect(detect_frame, scale=detect_scale)   # LieDetectResult (opencv 权威)
         now = time.time()
         is_active = self._update_debounce(r.active, now)
 
@@ -143,7 +163,7 @@ class _ServerState:
                 self.samurai.stop()
                 self._reset_debounce()
                 return {"ok": True, "active": False, "phase": "idle", "center": None,
-                        "confidence": 0.0, "bbox": None}
+                        "confidence": 0.0, "bbox": None, "s_bbox": None}
         else:
             self._activated_at = 0.0
 
@@ -151,7 +171,7 @@ class _ServerState:
             if self.samurai.session_active:
                 self.samurai.stop()
             return {"ok": True, "active": False, "phase": "idle", "center": None,
-                    "confidence": 0.0, "bbox": None}
+                    "confidence": 0.0, "bbox": None, "s_bbox": None}
 
         # 激活中: 维护 samurai 会话
         started_now = False
@@ -164,9 +184,10 @@ class _ServerState:
             res = self.samurai.step(frame_bgr)
             center = r.target_center
             conf = r.confidence
+            s_bbox = None
             if res is not None:
-                s_center, s_conf = res
-                # 锚点守卫: opencv 强检测且分歧大 → 信 opencv
+                s_center, s_conf, s_bbox = res
+                # 锚点守卫: opencv 强检测且分歧大 → 信 opencv (并清掉 samurai 框, 让客户端画 opencv 框)
                 if (
                     r.target_center is not None
                     and r.confidence >= ANCHOR_GUARD_MIN_CONF
@@ -174,6 +195,7 @@ class _ServerState:
                 ):
                     center = r.target_center
                     conf = r.confidence
+                    s_bbox = None
                 else:
                     center = s_center
                     conf = s_conf
@@ -181,6 +203,7 @@ class _ServerState:
         else:
             center = r.target_center
             conf = r.confidence
+            s_bbox = None
 
         return {
             "ok": True,
@@ -189,6 +212,7 @@ class _ServerState:
             "center": None if center is None else [int(center[0]), int(center[1])],
             "confidence": round(float(conf), 4),
             "bbox": None if r.target_bbox is None else [int(v) for v in r.target_bbox],
+            "s_bbox": None if s_bbox is None else [int(v) for v in s_bbox],
         }
 
     def _update_debounce(self, candidate_active: bool, now: float) -> bool:

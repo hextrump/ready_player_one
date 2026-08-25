@@ -82,9 +82,13 @@ class OpenCVBackend:
     def import_error(self) -> Optional[Exception]:
         return self._import_error
 
-    def detect(self, frame: np.ndarray) -> LieDetectResult:
+    def detect(self, frame: np.ndarray, scale: float = 1.0) -> LieDetectResult:
         """每帧调用: 输出 LieDetectResult (active=False 表示未触发, 决策层只看 active=True 的帧)。
 
+        Args:
+            frame: 待检测帧 (BGR)。
+            scale: <1.0 表示 frame 已是全分辨率帧的缩小版 (服务端降采样检测提速)。
+                   绝对阈值 (面积/最小尺寸) 同步按 scale 缩放, 返回的 bbox/center 缩回全分辨率坐标。
         Returns:
             LieDetectResult(active=False) — 未触发 / 导入失败
             LieDetectResult(active=True, phase=..., target_center=(cx,cy), target_bbox=(x1,y1,x2,y2),
@@ -108,25 +112,32 @@ class OpenCVBackend:
         try:
             # 自己跑多阈值, 计数得到 confidence; detect_white_target 内部已用同样四个阈值
             # 但它只返回最大的 bbox, 不返回每个阈值命中数。这里复刻一遍拿命中数。
-            bbox, matched = self._detect_with_confidence(frame, window_bbox)
+            bbox, matched = self._detect_with_confidence(frame, window_bbox, scale)
         except Exception as e:
             log.debug(f"[opencv] target detect failed: {e}")
 
         if bbox is None:
             return LieDetectResult(active=False, backend=LieBackend.OPENCV)
 
-        # 3. bbox 膨胀 (亮核 → 完整星形)
+        # 3. bbox 膨胀 (亮核 → 完整星形); 膨胀比乘性, 降采样空间膨胀后缩回等价全分辨率膨胀
         x1, y1, x2, y2 = inflate_bbox(bbox, ratio=1.6)
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(W, x2), min(H, y2)
 
-        # 4. 亮度 (目标 ROI 平均)
+        # 4. 亮度 (目标 ROI 平均; mean 亮度尺度不变, 降采样 ROI 足够)
         roi = frame[y1:y2, x1:x2]
         brightness = float(roi.mean()) if roi.size else 0.0
 
-        # 5. 中心
+        # 5. 中心 (降采样空间)
         cx = (x1 + x2) // 2
         cy = (y1 + y2) // 2
+
+        # 5b. 缩回全分辨率坐标 (scale<1 时放大 1/scale)
+        if scale != 1.0 and scale > 0:
+            inv = 1.0 / scale
+            x1, y1 = int(round(x1 * inv)), int(round(y1 * inv))
+            x2, y2 = int(round(x2 * inv)), int(round(y2 * inv))
+            cx, cy = int(round(cx * inv)), int(round(cy * inv))
 
         # 6. phase: 简化判定 — 目标稳定 = COUNTDOWN; bbox 大小变化 = TRACKING
         # 这里给个保守值, 让调用方根据帧间位移再精修
@@ -143,9 +154,13 @@ class OpenCVBackend:
         )
 
     def _detect_with_confidence(
-        self, frame: np.ndarray, window_bbox: Optional[Tuple[int, int, int, int]]
+        self, frame: np.ndarray, window_bbox: Optional[Tuple[int, int, int, int]],
+        scale: float = 1.0,
     ) -> Tuple[Optional[Tuple[int, int, int, int]], int]:
-        """复刻 detect_white_target 的多阈值逻辑, 同时返回命中数 (=confidence)。"""
+        """复刻 detect_white_target 的多阈值逻辑, 同时返回命中数 (=confidence)。
+
+        scale < 1.0: 帧已降采样, 绝对阈值 (面积≥200, 最小边≥15) 同步缩放, 保住降采样后的小目标。
+        """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if window_bbox is not None:
             x1, y1, x2, y2 = window_bbox
@@ -156,6 +171,9 @@ class OpenCVBackend:
             roi_offset = (0, 0)
 
         H_roi, W_roi = roi.shape[:2]
+        s = max(scale, 1e-3)
+        min_area = int(200 * s * s)      # 全分辨率面积阈 200px² → 按 scale² 缩放
+        min_dim = max(1, int(15 * s))    # 全分辨率最小边 15px → 按 scale 缩放
         best_per_thresh = {}  # thresh → max_area_bbox
         for thresh in THRESHOLD_LEVELS:
             _, bright = cv2.threshold(roi, thresh, 255, cv2.THRESH_BINARY)
@@ -164,11 +182,11 @@ class OpenCVBackend:
             num, labels, stats, _ = cv2.connectedComponentsWithStats(bright)
             for i in range(1, num):
                 x, y, w, h, area = stats[i]
-                if area < 200 or area > 0.05 * H_roi * W_roi:
+                if area < min_area or area > 0.05 * H_roi * W_roi:
                     continue
                 if max(w, h) / max(1, min(w, h)) > 1.5:
                     continue
-                if min(w, h) < 15:
+                if min(w, h) < min_dim:
                     continue
                 ax1, ay1 = x + roi_offset[0], y + roi_offset[1]
                 if thresh not in best_per_thresh or area > best_per_thresh[thresh][4]:
