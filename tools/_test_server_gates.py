@@ -143,7 +143,8 @@ def main() -> int:
     # 帧2-3: tracking, samurai step 正常跟随 (miss 0)
     # 帧4-5: opencv miss (目标消失)
     # 帧6: conf=0.25 @(368,432) (新事件弱检测)
-    # 期望: 会话在帧5 (miss 满2) 被停; 帧6 不拿 0.25 起新会话 (starts 保持 1, s_bbox=None)
+    # 期望: 会话在帧5 (miss 满2) 被停; 帧6 不拿 0.25 起新会话 (starts 保持 1),
+    #       且 P4 冷锚门拒 0.25 → center=None (旧逻辑会直接锚 digit 把鼠标拽走 — 这是没断言的漏网 bug)
     tr = LiePhase.TRACKING
     seqB = [
         (True, tr, (762, 358), 0.99, (750, 350, 774, 366)),
@@ -158,9 +159,10 @@ def main() -> int:
         smB.starts == 1                # 只有帧1 起过一次会话
         and smB.stops >= 1             # miss 满 2 停掉
         and outsB[5]['s_bbox'] is None  # 帧6 没起新会话 (0.25 被门禁拦下)
+        and outsB[5]['center'] is None  # P4: 冷锚 conf 0.25 < 0.35 → center=None 不锚
     )
     all_ok &= b_ok
-    print(f"  场景B 结果: {'PASS' if b_ok else 'FAIL'} (starts 应=1, stops≥1, 帧6 s_bbox=None)")
+    print(f"  场景B 结果: {'PASS' if b_ok else 'FAIL'} (starts 应=1, stops≥1, 帧6 s_bbox=None center=None)")
 
     # ── 场景 C: countdown 预热 samurai (idx 256 区域) ──
     # 帧1-4: countdown 星形静止 conf 0.5 (较亮, 连续稳定)
@@ -183,6 +185,96 @@ def main() -> int:
     )
     all_ok &= c_ok
     print(f"  场景C 结果: {'PASS' if c_ok else 'FAIL'} (starts 应=1, 帧5 s_bbox 非 None)")
+
+    # ── 场景 D: tracking 中途相位振荡 TRACKING→COUNTDOWN→TRACKING + 远处 conf=1.0 大块数字 ──
+    # 帧1-2: tracking, samurai 会话建立+跟随
+    # 帧3:   countdown 振荡 (matched 抖动) → P2 协成 tracking → 不 new_event, 会话继续 step
+    # 帧4-5: 远 conf=1.0 大块 (80x120) 数字抢目标 → 锚点守卫 → 远跳确认, 确认满 2 帧后尺寸门拒 → hold 星形
+    # 期望: starts=1 (不重锚), 不 new_event (帧3 coerced), center 全程星形不跳数字
+    cd = LiePhase.COUNTDOWN
+    seqD = [
+        (True, tr, (600, 400), 0.99, (590, 390, 610, 410)),
+        (True, tr, (601, 401), 0.99, (591, 391, 611, 411)),
+        (True, cd, (600, 400), 0.5, (590, 390, 610, 410)),
+        (True, tr, (900, 300), 1.0, (850, 230, 950, 370)),
+        (True, tr, (900, 300), 1.0, (850, 230, 950, 370)),
+    ]
+    outsD, smD = run("D: 相位振荡 + 远处 conf1.0 大块 (idx 81 场景)", seqD)
+    d3, d4, d5 = outsD[2], outsD[3], outsD[4]
+    d_ok = (
+        smD.starts == 1 and smD.stops == 0                     # 振荡不杀会话不重锚
+        and d3['phase'] == 'tracking' and d3['diag']['coerced'] is True  # P2 协成生效
+        and d3['diag']['phase_raw'] == 'countdown'
+        and d3['diag']['new_event'] is False                    # 不误触发新事件清锚
+        and d4['center'] == [601, 401] and d5['center'] == [601, 401]   # 确认中 hold 星形
+        and d5['diag']['rejected'] is True                      # 远跳被拒 (尺寸门)
+    )
+    all_ok &= d_ok
+    print(f"  场景D 结果: {'PASS' if d_ok else 'FAIL'} (振荡不杀会话; 远处数字被尺寸门拒, center 保持星形)")
+
+    # ── 场景 E: tracking 中远处大 bbox 数字 conf=1.0 → 尺寸门拒 (无振荡干扰) ──
+    # 帧1: 去抖激活用 (首帧 idle, 不锚); 帧2: 冷锚星形; 帧3-4: 远 conf1.0 大块确认 → 尺寸门拒
+    seqE = [
+        (True, tr, (600, 400), 0.99, (590, 390, 610, 410)),
+        (True, tr, (600, 400), 0.99, (590, 390, 610, 410)),
+        (True, tr, (900, 300), 1.0, (850, 230, 950, 370)),
+        (True, tr, (900, 300), 1.0, (850, 230, 950, 370)),
+    ]
+    outsE, smE = run("E: tracking 远 conf1.0 大 bbox 数字 → 尺寸门拒", seqE)
+    e_ok = (
+        smE.starts == 1
+        and outsE[2]['center'] == [600, 400]      # 确认第1帧 hold 星形
+        and outsE[3]['center'] == [600, 400]      # 确认第2帧尺寸拒 → 仍 hold 最后接受中心
+        and all(o['center'] != [900, 300] for o in outsE)
+    )
+    all_ok &= e_ok
+    print(f"  场景E 结果: {'PASS' if e_ok else 'FAIL'} (数字被尺寸门拒, 永不跳 (900,300))")
+
+    # ── 场景 F: 远处同尺寸强候选 conf=0.9 → 第2帧确认后重锚 (合法远移恢复) ──
+    seqF = [
+        (True, tr, (600, 400), 0.99, (590, 390, 610, 410)),
+        (True, tr, (600, 400), 0.99, (590, 390, 610, 410)),
+        (True, tr, (900, 300), 0.9, (890, 290, 910, 310)),
+        (True, tr, (900, 300), 0.9, (890, 290, 910, 310)),
+    ]
+    outsF, smF = run("F: 远同尺寸 conf0.9 → 2帧确认重锚 (合法远移)", seqF)
+    f_ok = (
+        smF.starts == 2                        # 帧4重锚 (确认后真重启会话)
+        and outsF[2]['center'] == [600, 400]   # 确认第1帧 hold 旧锚
+        and outsF[3]['center'] == [900, 300]   # 第2帧确认通过 → 重锚到新位置
+    )
+    all_ok &= f_ok
+    print(f"  场景F 结果: {'PASS' if f_ok else 'FAIL'} (第2帧确认后重锚 (900,300))")
+
+    # ── 场景 G: 冷起始 conf=0.25 junk → center=None 不锚; 下帧 conf=0.5 → 正常跟随 ──
+    seqG = [
+        (True, tr, (368, 432), 0.25, (350, 420, 386, 444)),
+        (True, tr, (368, 432), 0.25, (350, 420, 386, 444)),
+        (True, tr, (370, 434), 0.5, (350, 420, 390, 448)),
+    ]
+    outsG, smG = run("G: 冷起始 conf0.25 junk (idx 144/250 场景)", seqG)
+    g_ok = (
+        smG.starts == 1                                     # 只有 conf0.5 起会话
+        and outsG[1]['active'] is True and outsG[1]['center'] is None   # 帧2: 0.25 冷锚拒
+        and outsG[2]['center'] == [370, 434]                # 帧3: 0.5 正常锚
+    )
+    all_ok &= g_ok
+    print(f"  场景G 结果: {'PASS' if g_ok else 'FAIL'} (0.25 不锚 center=None; 0.5 正常跟随)")
+
+    # ── 场景 H: countdown 冷起始超大 bbox (560x440) → P4 冷锚尺寸上限拒 → 会话不启动 ──
+    seqH = [
+        (True, cd, (480, 270), 0.5, (200, 50, 760, 490)),
+        (True, cd, (480, 270), 0.5, (200, 50, 760, 490)),
+        (True, cd, (480, 270), 0.5, (200, 50, 760, 490)),
+    ]
+    outsH, smH = run("H: countdown 冷起始超大亮块 → 冷锚尺寸上限拒", seqH)
+    h_ok = (
+        smH.starts == 0                                     # 会话不启动 (无预热)
+        and outsH[1]['active'] is True and outsH[1]['center'] is None
+        and outsH[2]['center'] is None
+    )
+    all_ok &= h_ok
+    print(f"  场景H 结果: {'PASS' if h_ok else 'FAIL'} (超大块冷锚被拒, 会话不启动)")
 
     print(f"\n全部: {'PASS' if all_ok else 'FAIL'}")
     return 0 if all_ok else 1

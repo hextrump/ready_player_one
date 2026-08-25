@@ -74,6 +74,23 @@ REANCHOR_CLOSE_DIST = 100
 COUNTDOWN_STABLE_FRAMES = 3
 COUNTDOWN_ANCHOR_MIN_CONF = 0.35
 
+# ── P1 尺寸门: 候选 bbox 面积须接近锚面积 (防数字/大亮块抢"最大白块"名额) ──
+# 基线 diag 实测 (同事件换轮, miss_run=0, P2 协成后走远跳确认): 合法/边缘星形面积比最高 ~7.0x
+# (BV1QxcKzXEHT idx453, ≈2.6x 线性), 错选数字/大块面积比 ≥9.3x (size_x9~x19)。取 8.0
+# (≈2.83x 线性): 放行合法 ≤7.0x, 拒掉 ≥9.3x 错选。面积比相对分辨率不变 (跨视频通用)。
+SIZE_GATE_FACTOR = 8.0
+# 冷锚 (无锚参考) 绝对上限: bbox 最大边 ≤ 帧短边此比例。基线实测最大合法星形 ~230px @768 短边
+# (BV1sMy8BvEqy p50=53058 ≈ 230x230) → 0.5 留足余量; 数字 ~160x230 @1366x768 也拦不住但冷锚
+# 还有 P4 conf 门兜底。
+COLD_ANCHOR_MAX_DIM_FRAC = 0.5
+
+# ── P3 远跳确认: >TRACKING_GATE_DIST 的候选须连续帧同位置 + 尺寸合理才重锚 ──
+# 取消 conf≥0.8 单帧豁免 — 数字/大亮块常常 conf 也很高 (基线 idx 63 conf=1.0 是 legit, 但
+# 守卫两值振荡时两边 conf 都高)。远跳一律确认, 同一候选中心 (容差内) 连续 N 帧才重锚。
+FAR_CONFIRM_TOLERANCE = 30    # 确认窗口内候选中心容差 (px)
+FAR_CONFIRM_FRAMES_HIGH = 2   # 窗口内最高 conf ≥ GATE_HIGH_CONF → 2 帧确认
+FAR_CONFIRM_FRAMES_LOW = 3    # 否则 3 帧确认
+
 
 class _ServerState:
     """服务端共享状态: opencv 检测 + samurai 流式 + 去抖/超时 (单会话)。"""
@@ -109,6 +126,8 @@ class _ServerState:
         self._last_phase: Optional[LiePhase] = None           # 上一帧阶段 (countdown 首帧 = 新事件)
         self._countdown_stable = 0                            # countdown 连续稳定帧计数 (预热 samurai 用)
         self._seen_tracking = False                           # 本事件内是否见过 TRACKING (相位单调性, P2)
+        self._anchor_bbox: Optional[Tuple[int, int, int, int]] = None  # 最近接受候选的 bbox (P1 尺寸门锚参考)
+        self._pending: Optional[dict] = None                  # P3 远跳确认窗口 {center,bbox,conf,count}
         self._device: Optional[str] = None
 
         if not self.opencv.ready:
@@ -179,6 +198,11 @@ class _ServerState:
         # 进入本帧前的连续 miss 数 (事件切换判定: 目标消失 2+ 帧 = 旧事件结束)
         miss_run = self._debounce.miss_streak
         prev_phase = self._last_phase
+        phase_raw_orig = r.phase
+        # P2 相位单调性: 事件内见过 tracking 后, opencv 的 countdown/tracking 抖动一律按 tracking 处理
+        # (matched 阈值抖动会让同一目标在倒计时/跟踪间互翻, 翻回 countdown 会误触发"新事件"清锚/清会话)
+        if r.phase == LiePhase.COUNTDOWN and self._seen_tracking:
+            r.phase = LiePhase.TRACKING
 
         # 目标丢失: 连续 miss 满 EVENT_END_MISSES → 立刻停会话 (防旧会话带旧锚点活到新事件)
         if not r.active and miss_run + 1 >= EVENT_END_MISSES:
@@ -191,9 +215,20 @@ class _ServerState:
             if self._activated_at == 0.0:
                 self._activated_at = now
             elif self._timeout_sec > 0 and (now - self._activated_at) > self._timeout_sec:
-                print(f"[server] 激活超时 ({self._timeout_sec:.0f}s), 强制解除会话", file=sys.stderr)
-                self._end_event("超时")
-                self._reset_debounce()
+                print(f"[server] 激活超时 ({self._timeout_sec:.0f}s), 停会话保留锚点", file=sys.stderr)
+                # P4: 超时停会话释放显存, 但不清 _last_center — 下一帧从最后已知位置恢复
+                # (距离门/远跳确认), 防 conf=0.25 junk 走"无锚冷锚"路径抢锚把鼠标拽走。
+                # 基线: BV17eGn69EAM idx144/293、BV1HiyhBNEUe idx250、BV1hxcKzXEXW idx312/414 全是
+                # 超时后冷锚 digit → 鼠标歪 ~30s。清 _last_phase 让同事件 countdown 重新走新事件流程。
+                self.samurai.stop()
+                self._countdown_stable = 0
+                self._pending = None
+                self._debounce.active = False
+                self._debounce.hit_streak = 0
+                self._debounce.miss_streak = 0
+                self._activated_at = 0.0
+                self._last_phase = None
+                self._seen_tracking = False
                 return self._idle_response()
         else:
             self._activated_at = 0.0
@@ -226,7 +261,7 @@ class _ServerState:
             "oc": None if r.target_center is None else [int(r.target_center[0]), int(r.target_center[1])],
             "ob": None if r.target_bbox is None else [int(v) for v in r.target_bbox],
             "matched": int(round(r.confidence * 4)),
-            "phase_raw": r.phase.value,
+            "phase_raw": phase_raw_orig.value,
             "new_event": new_event,
             "miss_run": miss_run,
             "anchor": None if self._last_center is None else list(self._last_center),
@@ -237,12 +272,15 @@ class _ServerState:
             "anchor_guard": False,
             "cd_stable": self._countdown_stable,
             "seen_tracking": self._seen_tracking,
+            "coerced": r.phase is not phase_raw_orig,
+            "pending": self._pending is not None,
         }
 
         if r.phase == LiePhase.COUNTDOWN:
             # 倒计时: 星形静止, opencv 权威, 强空间门 (距离门对置信无豁免 — 星形不会跳)
             center, accepted = self._gate_center(r.target_center, r.confidence, COUNTDOWN_GATE_DIST,
-                                                 conf_bypass=False)
+                                                 conf_bypass=False, cand_bbox=r.target_bbox,
+                                                 frame_shape=frame_bgr.shape)
             bbox_out = r.target_bbox if accepted else None
             diag["branch"] = "countdown"
             # 预热 samurai: countdown 星形静止且较亮, 连续稳定后起会话 (tracking 进入即有 mask)
@@ -266,7 +304,7 @@ class _ServerState:
                     started = self.samurai.start(frame_bgr, tuple(int(v) for v in r.target_bbox))
             if started:
                 diag["branch"] = "tracking_start"
-                center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
+                center, accepted = self._tracking_gate(r.target_center, r.confidence, r.target_bbox, frame_bgr)
                 conf = r.confidence
                 bbox_out = r.target_bbox if accepted else None
             elif self.samurai.session_active:
@@ -275,7 +313,7 @@ class _ServerState:
                     s_center, s_conf, s_bbox = res
                     diag["sam_center"] = [int(s_center[0]), int(s_center[1])]
                     diag["sam_conf"] = round(float(s_conf), 4)
-                    # 锚点守卫: opencv 强检测且分歧大 → 信 opencv (并清掉 samurai 框)
+                    # 锚点守卫: opencv 强检测且分歧大 → 信 opencv (P3: 走远跳确认, 并真重置会话, 修两值振荡)
                     guard = (
                         r.target_center is not None
                         and r.confidence >= ANCHOR_GUARD_MIN_CONF
@@ -284,23 +322,25 @@ class _ServerState:
                     diag["anchor_guard"] = guard
                     diag["branch"] = "samurai_step"
                     if guard:
-                        center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
+                        center, accepted = self._tracking_gate(r.target_center, r.confidence, r.target_bbox, frame_bgr)
                         conf = r.confidence
                     else:
-                        center, accepted = self._gate_center(s_center, s_conf, TRACKING_GATE_DIST)
+                        # samurai 自身 step 输出: 局部立即接受, 远跳用 conf≥0.8 豁免 (星形快速移动)
+                        center, accepted = self._gate_center(s_center, s_conf, TRACKING_GATE_DIST,
+                                                             cand_bbox=s_bbox, frame_shape=frame_bgr.shape)
                         conf = s_conf
                 else:
-                    # step 失败 (目标消失) → 回退 opencv (过门)
+                    # step 失败 (目标消失) → 回退 opencv (走远跳确认)
                     diag["branch"] = "samurai_fail"
-                    center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
+                    center, accepted = self._tracking_gate(r.target_center, r.confidence, r.target_bbox, frame_bgr)
                 if not accepted:
                     s_bbox = None
                 bbox_out = r.target_bbox if accepted else None
                 self._track_count += 1
             else:
-                # 会话未起 (门禁拦下) → opencv 输出 (过门)
+                # 会话未起 (门禁拦下) → opencv 输出 (走远跳确认)
                 diag["branch"] = "opencv_nosession"
-                center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
+                center, accepted = self._tracking_gate(r.target_center, r.confidence, r.target_bbox, frame_bgr)
                 bbox_out = r.target_bbox if accepted else None
         else:
             # 激活中但 opencv miss (去抖未解除) → 无目标, 客户端 hold
@@ -345,6 +385,8 @@ class _ServerState:
         self._last_phase = None
         self._countdown_stable = 0
         self._seen_tracking = False
+        self._anchor_bbox = None
+        self._pending = None
 
     # ── 事件生命周期 + 空间门 helper ──
 
@@ -365,29 +407,115 @@ class _ServerState:
         self._last_phase = None
         self._countdown_stable = 0
         self._seen_tracking = False
+        self._anchor_bbox = None
+        self._pending = None
         if stopped:
             print(f"[server] 会话结束 ({reason or '事件结束'})", file=sys.stderr)
 
     def _gate_center(self, candidate, conf: float, gate_dist: float,
-                     conf_bypass: bool = True):
+                     conf_bypass: bool = True, cand_bbox=None, frame_shape=None):
         """空间门: 候选中心相对已锚定目标跳变过大 → 判定错选, 返回 (hold_center, False)。
 
         返回 (输出中心, 是否接受)。接受 → 更新锚; 拒绝 → 输出上帧已接受中心 (hold)。
-        - 无锚 → 接受 (首检即锚)。
-        - conf_bypass=True: 置信 ≥ GATE_HIGH_CONF 的跳变豁免 (强检测可信)。
+        - 无锚 → P4 冷锚门: 需 conf ≥ REANCHOR_MIN_CONF 且 bbox 尺寸合理 — 防 conf=0.25 junk /
+          超大亮块抢首锚把鼠标拽走 (基线 5 处 mid_event 全是超时后冷锚 digit)。
+        - conf_bypass=True: 置信 ≥ GATE_HIGH_CONF 的跳变豁免 (强检测可信, samurai step 用)。
           False (countdown): 距离门对置信无豁免 — 倒计时内星形静止, 任何大跳都是错选。
         """
         if candidate is None:
             return (None, False)
         cand = (int(candidate[0]), int(candidate[1]))
         if self._last_center is None:
+            # P4: 冷起始低置信/超大块不锚 — 宁可 hold, 等更强/尺寸正常的检测
+            if conf < REANCHOR_MIN_CONF or not self._size_plausible(cand_bbox, frame_shape):
+                return (None, False)
             self._last_center = cand
+            self._update_anchor_bbox(cand_bbox)
             return (self._last_center, True)
         d = np.hypot(cand[0] - self._last_center[0], cand[1] - self._last_center[1])
         if d > gate_dist and (not conf_bypass or conf < GATE_HIGH_CONF):
             return (self._last_center, False)   # 错选: hold 上帧中心
         self._last_center = cand
+        self._update_anchor_bbox(cand_bbox)
         return (self._last_center, True)
+
+    def _update_anchor_bbox(self, cand_bbox) -> None:
+        """接受候选时更新锚 bbox (P1 尺寸门参考)。None 传入不破坏旧参考。"""
+        if cand_bbox is not None:
+            self._anchor_bbox = tuple(int(v) for v in cand_bbox)
+
+    def _size_plausible(self, cand_bbox, frame_shape) -> bool:
+        """P1 尺寸门: 候选 bbox 面积须接近锚面积, 或 (冷锚时) 不超过绝对上限。
+
+        - 有锚: 面积比 ∈ [1/SIZE_GATE_FACTOR, SIZE_GATE_FACTOR]。数字 vs 星形面积可差 5-20x
+          (基线 diag size_x9~x19) → 被拒; 星形渐隐缩小时面积比降到 1/4 仍放行。
+        - 无锚 (冷锚): bbox 最大边 ≤ 帧短边 * COLD_ANCHOR_MAX_DIM_FRAC — 防超大亮块抢首锚。
+        - 无 bbox / 无帧信息: 放行 (不因缺信息而拦, 保持现行为)。
+        """
+        if cand_bbox is None or frame_shape is None:
+            return True
+        x1, y1, x2, y2 = (int(v) for v in cand_bbox)
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        if self._anchor_bbox is not None:
+            ax1, ay1, ax2, ay2 = self._anchor_bbox
+            aarea = max(1, (ax2 - ax1) * (ay2 - ay1))
+            r = (w * h) / aarea
+            lo = 1.0 / SIZE_GATE_FACTOR
+            hi = SIZE_GATE_FACTOR
+            return lo <= r <= hi
+        short_side = float(min(frame_shape[0], frame_shape[1]))
+        return max(w, h) <= COLD_ANCHOR_MAX_DIM_FRAC * short_side
+
+    def _tracking_gate(self, cand_center, cand_conf, cand_bbox, frame_bgr):
+        """TRACKING 路径统一门: 局部立即接受; 远跳需连续帧确认 + 尺寸合理 (P3); 冷锚走 P4。
+
+        远跳 (>TRACKING_GATE_DIST) 是 opencv 换对象的最大嫌疑 (数字抢选 / 锚点守卫两值振荡):
+        同一候选中心 (容差 ≤ FAR_CONFIRM_TOLERANCE) 连续 FAR_CONFIRM_FRAMES_* 帧且
+        _size_plausible 才重锚, 否则 hold 旧锚。取消 conf≥0.8 单帧豁免 — 数字 conf 也常很高。
+        确认通过时若会话还活着, 把 samurai 会话真正重置到新锚 (修守卫只输出中心不重开会话的振荡)。
+        """
+        if cand_center is None:
+            self._pending = None
+            return (None, False)
+        cand = (int(cand_center[0]), int(cand_center[1]))
+        if self._last_center is None:
+            self._pending = None
+            return self._gate_center(cand, cand_conf, TRACKING_GATE_DIST, True,
+                                     cand_bbox, frame_bgr.shape)
+        d = np.hypot(cand[0] - self._last_center[0], cand[1] - self._last_center[1])
+        if d <= TRACKING_GATE_DIST:
+            # 局部: 立即接受 (星形正常移动)
+            self._pending = None
+            return self._gate_center(cand, cand_conf, TRACKING_GATE_DIST, True,
+                                     cand_bbox, frame_bgr.shape)
+        # 远跳: 进入/更新确认窗口
+        p = self._pending
+        if p is not None and np.hypot(cand[0] - p["center"][0], cand[1] - p["center"][1]) <= FAR_CONFIRM_TOLERANCE:
+            p["count"] += 1
+            p["conf"] = max(p["conf"], cand_conf)
+            if cand_bbox is not None:
+                p["bbox"] = cand_bbox
+            need = FAR_CONFIRM_FRAMES_HIGH if p["conf"] >= GATE_HIGH_CONF else FAR_CONFIRM_FRAMES_LOW
+            if p["count"] >= need:
+                if not self._size_plausible(p["bbox"], frame_bgr.shape):
+                    # 尺寸不过关: 候选判死 (数字/大块), 清确认窗口, 下次同点重新计数
+                    self._pending = None
+                    return (self._last_center, False)
+                self._pending = None
+                self._last_center = cand
+                self._update_anchor_bbox(p["bbox"])
+                if self.samurai.session_active and p["bbox"] is not None:
+                    try:
+                        self.samurai.start(frame_bgr, tuple(int(v) for v in p["bbox"]))
+                        print(f"[server] P3 重锚会话 @ {cand} (远跳确认 {p['count']}帧)", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[server] P3 重锚重启会话失败: {e}", file=sys.stderr)
+                return (self._last_center, True)
+            return (self._last_center, False)   # 确认中: hold
+        # 新远跳候选: 开始确认
+        self._pending = {"center": cand, "bbox": cand_bbox, "conf": cand_conf, "count": 1}
+        return (self._last_center, False)
 
     def _anchoring_ok(self, r, new_event: bool) -> bool:
         """重锚定门禁: 能否用本帧 opencv 检测起/重起 samurai 会话 (防 conf=0.25 junk 锚错)。

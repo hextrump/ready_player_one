@@ -346,7 +346,9 @@ def main() -> None:
 
             # ── 检测 + 喂目标 ──
             res = model.update(frame)
-            if res.active:
+            # None 守卫 (P4 冷锚门): 服务端在无锚 + conf<0.35/尺寸异常时返回 center:null —
+            # 客户端保持上帧目标不更新 (生产 combat_brain 已 None-safe; 这里防 target_center[0] 崩)
+            if res.active and res.target_center is not None:
                 scale, pl, pt = wc.last_letterbox
                 tracker.update_target(
                     cx=res.target_center[0], cy=res.target_center[1],
