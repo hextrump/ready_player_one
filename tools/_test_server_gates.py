@@ -251,6 +251,7 @@ def main() -> int:
     # 锚点守卫 `and ... np.hypot(...) > D` 末项是 np.bool_, 落进 diag.anchor_guard。
     # 测试直调 handle_frame 不经过 _send_json, 得显式过 json.dumps 才抓得住。
     import json as _json
+    from tools.lie_detect_server import _Handler  # noqa: E402
     seqJ = [
         (True, tr, (600, 400), 0.99, (590, 390, 610, 410)),
         (True, tr, (600, 400), 0.99, (590, 390, 610, 410)),
@@ -258,11 +259,14 @@ def main() -> int:
         (True, tr, (900, 300), 0.9, (890, 290, 910, 310)),
     ]
     outsJ, smJ = run("J: 守卫 np.bool_ 响应 → json.dumps 可序列化", seqJ)
-    j_ok = all(_json.dumps(o) for o in outsJ)          # 每帧都能出 JSON (不崩)
+    j_raw = all(_json.dumps(o) for o in outsJ)                     # 原始 dict 无 np 类型 (bool guard 生效)
+    j_wire = all(_json.dumps(_Handler._json_clean(o)) for o in outsJ)  # 走 _send_json 清洗路径也不崩
     j_guard_seen = any((o.get("diag") or {}).get("anchor_guard") for o in outsJ)
+    j_ok = j_raw and j_wire
     all_ok &= j_ok
     print(f"  场景J 结果: {'PASS' if j_ok else 'FAIL'} "
-          f"(np.bool_ 序列化{'守卫已触发' if j_guard_seen else '未触发守卫'} json.dumps 全通过)")
+          f"(np.bool_ 序列化{'守卫已触发' if j_guard_seen else '未触发守卫'} "
+          f"raw={j_raw} wire={j_wire})")
 
     # ── 场景 G: 冷起始 conf=0.25 junk → center=None 不锚; 下帧 conf=0.5 → 正常跟随 ──
     seqG = [

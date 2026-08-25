@@ -614,9 +614,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _json_clean(obj):
         """递归把 numpy 标量/数组转成 Python 原生, 否则 json.dumps 崩 (np.bool_ 不可序列化)。"""
         if isinstance(obj, dict):
-            return {k: _ServerHandler._json_clean(v) for k, v in obj.items()}
+            return {k: _Handler._json_clean(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple)):
-            return [_ServerHandler._json_clean(v) for v in obj]
+            return [_Handler._json_clean(v) for v in obj]
         if isinstance(obj, np.bool_):
             return bool(obj)
         if isinstance(obj, np.integer):
@@ -624,7 +624,7 @@ class _Handler(BaseHTTPRequestHandler):
         if isinstance(obj, np.floating):
             return float(obj)
         if isinstance(obj, np.ndarray):
-            return _ServerHandler._json_clean(obj.tolist())
+            return _Handler._json_clean(obj.tolist())
         return obj
 
     def _send_json(self, obj: dict, code: int = 200) -> None:
