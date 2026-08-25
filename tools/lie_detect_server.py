@@ -90,6 +90,8 @@ COLD_ANCHOR_MAX_DIM_FRAC = 0.5
 FAR_CONFIRM_TOLERANCE = 30    # 确认窗口内候选中心容差 (px)
 FAR_CONFIRM_FRAMES_HIGH = 2   # 窗口内最高 conf ≥ GATE_HIGH_CONF → 2 帧确认
 FAR_CONFIRM_FRAMES_LOW = 3    # 否则 3 帧确认
+FAR_CONFIRM_MIN_CONF = 0.35   # 确认门槛: 窗口内最高 conf 须 ≥ 此值 — conf 0.25 (仅最低阈值命中)
+                              # 是"暗弱/数字"特征, 即便持久也不该重锚 (回归: 5 处 0.25 远跳被确认)
 
 
 class _ServerState:
@@ -498,6 +500,10 @@ class _ServerState:
                 p["bbox"] = cand_bbox
             need = FAR_CONFIRM_FRAMES_HIGH if p["conf"] >= GATE_HIGH_CONF else FAR_CONFIRM_FRAMES_LOW
             if p["count"] >= need:
+                if p["conf"] < FAR_CONFIRM_MIN_CONF:
+                    # 窗口最高 conf 不够 (0.25 暗弱/数字): 判死, 清窗口 — 持久也不重锚
+                    self._pending = None
+                    return (self._last_center, False)
                 if not self._size_plausible(p["bbox"], frame_bgr.shape):
                     # 尺寸不过关: 候选判死 (数字/大块), 清确认窗口, 下次同点重新计数
                     self._pending = None

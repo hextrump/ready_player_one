@@ -276,6 +276,25 @@ def main() -> int:
     all_ok &= h_ok
     print(f"  场景H 结果: {'PASS' if h_ok else 'FAIL'} (超大块冷锚被拒, 会话不启动)")
 
+    # ── 场景 I: 锚活着+会话死, 远 conf=0.25 候选持续 3+ 帧 → 远跳确认的 conf 门槛拒 ──
+    # 回归: BV17eGn69EAM idx100-102 (countdown 锚 + 预热失败无会话 + 0.25 blob 持久 → 错抢),
+    #        BV1XuySBvEFa idx274/301/415/576 同型。合法远跳 conf 均 ≥0.5。
+    seqI = [
+        (True, cd, (600, 400), 0.5, (590, 390, 610, 410)),
+        (True, cd, (600, 400), 0.5, (590, 390, 610, 410)),
+        (True, tr, (900, 300), 0.25, (890, 290, 910, 310)),
+        (True, tr, (900, 300), 0.25, (890, 290, 910, 310)),
+        (True, tr, (900, 300), 0.25, (890, 290, 910, 310)),
+    ]
+    outsI, smI = run("I: 锚活+会话死, 远 conf0.25 暗候选持久 → conf 门槛拒", seqI)
+    i_ok = (
+        smI.starts == 0                                    # 不重锚不起会话
+        and all(o['center'] != [900, 300] for o in outsI)  # 永不跳 (900,300)
+        and all(o['center'] == [600, 400] for o in outsI if o['center'])  # 持续 hold 星形
+    )
+    all_ok &= i_ok
+    print(f"  场景I 结果: {'PASS' if i_ok else 'FAIL'} (conf0.25 远跳被 conf 门槛拒, 持续 hold)")
+
     print(f"\n全部: {'PASS' if all_ok else 'FAIL'}")
     return 0 if all_ok else 1
 
