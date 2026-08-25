@@ -36,13 +36,15 @@ import socket
 import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import cv2
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.perception.lie_detector.state import LiePhase  # noqa: E402  事件阶段枚举 (服务端决策用)
 
 # 锚点守卫: opencv 置信 ≥ 此值 且 与 samurai 中心分歧 > 此值(px) → 信 opencv
 # 0.8 (不是 0.5): opencv 在 conf=0.5-0.7 (多阈值部分命中, 常见于弱/抖动检测) 时中心常漂移,
@@ -54,6 +56,19 @@ ANCHOR_GUARD_DIST = 120
 # 全帧 150-400ms → 缩放后 ~100ms)。绝对阈值由 opencv_backend 按 scale 同步缩放,
 # 返回坐标已缩回全分辨率。
 DETECT_MAX_SIDE = 320
+
+# ── 事件生命周期 + 空间门 (决策逻辑, 治"跟歪") ──
+# 空间门: 目标在连续可见段内帧间位移很小 (星形倒计时静止/跟踪缓移), 中心跳变过大 = 错选
+# (倒计时数字等大亮块抢"最大白块"名额)。拒绝跳变 → 输出上帧已接受中心 (hold),
+# 鼠标停在真目标上而非瞬移到错对象。
+COUNTDOWN_GATE_DIST = 25   # 倒计时内星形静止, 中心跳 >25px = 错选 (距离门对置信无豁免)
+TRACKING_GATE_DIST = 120   # 跟踪内允许星形较快移动, >120px 且低置信才拒
+GATE_HIGH_CONF = 0.8       # 置信 ≥ 此值 → 跳变豁免 (信强检测)
+# 事件边界: 连续 miss 满此帧数 = 事件结束/切换 (星形消失), 旧会话/旧锚作废
+EVENT_END_MISSES = 2
+# 重锚定门禁: 新事件首锚 (目标位置未知) 需最低置信; 同事件重锚需靠近上帧目标
+REANCHOR_MIN_CONF = 0.35
+REANCHOR_CLOSE_DIST = 100
 
 
 class _ServerState:
@@ -86,6 +101,8 @@ class _ServerState:
         self._activated_at = 0.0
         self._lock = threading.Lock()
         self._track_count = 0
+        self._last_center: Optional[Tuple[int, int]] = None   # 最近一次已接受的目标中心 (空间门/hold)
+        self._last_phase: Optional[LiePhase] = None           # 上一帧阶段 (countdown 首帧 = 新事件)
         self._device: Optional[str] = None
 
         if not self.opencv.ready:
@@ -152,6 +169,15 @@ class _ServerState:
             )
         r = self.opencv.detect(detect_frame, scale=detect_scale)   # LieDetectResult (opencv 权威)
         now = time.time()
+
+        # 进入本帧前的连续 miss 数 (事件切换判定: 目标消失 2+ 帧 = 旧事件结束)
+        miss_run = self._debounce.miss_streak
+        prev_phase = self._last_phase
+
+        # 目标丢失: 连续 miss 满 EVENT_END_MISSES → 立刻停会话 (防旧会话带旧锚点活到新事件)
+        if not r.active and miss_run + 1 >= EVENT_END_MISSES:
+            self._end_event("目标丢失")
+
         is_active = self._update_debounce(r.active, now)
 
         # 超时强制解除 (防 SAM2 卡住整个会话)
@@ -160,50 +186,80 @@ class _ServerState:
                 self._activated_at = now
             elif self._timeout_sec > 0 and (now - self._activated_at) > self._timeout_sec:
                 print(f"[server] 激活超时 ({self._timeout_sec:.0f}s), 强制解除会话", file=sys.stderr)
-                self.samurai.stop()
+                self._end_event("超时")
                 self._reset_debounce()
-                return {"ok": True, "active": False, "phase": "idle", "center": None,
-                        "confidence": 0.0, "bbox": None, "s_bbox": None}
+                return self._idle_response()
         else:
             self._activated_at = 0.0
 
         if not is_active:
-            if self.samurai.session_active:
-                self.samurai.stop()
-            return {"ok": True, "active": False, "phase": "idle", "center": None,
-                    "confidence": 0.0, "bbox": None, "s_bbox": None}
+            if self._in_event():
+                self._end_event("解除")
+            return self._idle_response()
 
-        # 激活中: 维护 samurai 会话
-        started_now = False
-        if not self.samurai.session_active:
-            # 首 TRACKING 帧 → 起会话 (bbox = opencv 已膨胀框); 倒计时阶段 opencv 权威
-            if r.phase == "tracking" and r.target_bbox is not None:
-                started_now = self.samurai.start(frame_bgr, tuple(int(v) for v in r.target_bbox))
+        # ── 事件边界: 旧目标作废, 本帧重新锚定 ──
+        # ① 连续 miss ≥ EVENT_END_MISSES 后恢复 = 事件切换 (新事件星形在新位置)
+        # ② 进入 countdown = 新事件开头 (countdown 只在事件起始出现; 顺带掐掉旧会话串扰)
+        new_event = False
+        if r.active:
+            if miss_run >= EVENT_END_MISSES:
+                new_event = True
+            elif r.phase == LiePhase.COUNTDOWN and prev_phase != LiePhase.COUNTDOWN:
+                new_event = True
+        if new_event:
+            self._end_event("新事件")
 
-        if self.samurai.session_active and not started_now:
-            res = self.samurai.step(frame_bgr)
-            center = r.target_center
-            conf = r.confidence
-            s_bbox = None
-            if res is not None:
-                s_center, s_conf, s_bbox = res
-                # 锚点守卫: opencv 强检测且分歧大 → 信 opencv (并清掉 samurai 框, 让客户端画 opencv 框)
-                if (
-                    r.target_center is not None
-                    and r.confidence >= ANCHOR_GUARD_MIN_CONF
-                    and np.hypot(s_center[0] - r.target_center[0], s_center[1] - r.target_center[1]) > ANCHOR_GUARD_DIST
-                ):
-                    center = r.target_center
-                    conf = r.confidence
-                    s_bbox = None
+        center = None
+        conf = r.confidence
+        s_bbox = None
+        bbox_out = None
+
+        if r.phase == LiePhase.COUNTDOWN:
+            # 倒计时: 星形静止, opencv 权威, 强空间门 (距离门对置信无豁免 — 星形不会跳)
+            center, accepted = self._gate_center(r.target_center, r.confidence, COUNTDOWN_GATE_DIST,
+                                                 conf_bypass=False)
+            bbox_out = r.target_bbox if accepted else None
+        elif r.phase == LiePhase.TRACKING:
+            started = False
+            if not self.samurai.session_active:
+                # 起会话: 重锚定门禁 (新事件低置信可起; 同事件需靠近上帧目标防错选)
+                if r.target_bbox is not None and self._anchoring_ok(r, new_event):
+                    started = self.samurai.start(frame_bgr, tuple(int(v) for v in r.target_bbox))
+            if started:
+                center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
+                conf = r.confidence
+                bbox_out = r.target_bbox if accepted else None
+            elif self.samurai.session_active:
+                res = self.samurai.step(frame_bgr)
+                if res is not None:
+                    s_center, s_conf, s_bbox = res
+                    # 锚点守卫: opencv 强检测且分歧大 → 信 opencv (并清掉 samurai 框)
+                    if (
+                        r.target_center is not None
+                        and r.confidence >= ANCHOR_GUARD_MIN_CONF
+                        and np.hypot(s_center[0] - r.target_center[0], s_center[1] - r.target_center[1]) > ANCHOR_GUARD_DIST
+                    ):
+                        center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
+                        conf = r.confidence
+                    else:
+                        center, accepted = self._gate_center(s_center, s_conf, TRACKING_GATE_DIST)
+                        conf = s_conf
                 else:
-                    center = s_center
-                    conf = s_conf
-            self._track_count += 1
+                    # step 失败 (目标消失) → 回退 opencv (过门)
+                    center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
+                if not accepted:
+                    s_bbox = None
+                bbox_out = r.target_bbox if accepted else None
+                self._track_count += 1
+            else:
+                # 会话未起 (门禁拦下) → opencv 输出 (过门)
+                center, accepted = self._gate_center(r.target_center, r.confidence, TRACKING_GATE_DIST)
+                bbox_out = r.target_bbox if accepted else None
         else:
-            center = r.target_center
-            conf = r.confidence
-            s_bbox = None
+            # 激活中但 opencv miss (去抖未解除) → 无目标, 客户端 hold
+            center, accepted = None, False
+
+        self._last_phase = r.phase
 
         return {
             "ok": True,
@@ -211,7 +267,7 @@ class _ServerState:
             "phase": r.phase.value,
             "center": None if center is None else [int(center[0]), int(center[1])],
             "confidence": round(float(conf), 4),
-            "bbox": None if r.target_bbox is None else [int(v) for v in r.target_bbox],
+            "bbox": None if bbox_out is None else [int(v) for v in bbox_out],
             "s_bbox": None if s_bbox is None else [int(v) for v in s_bbox],
         }
 
@@ -233,6 +289,62 @@ class _ServerState:
         self._debounce.hit_streak = 0
         self._debounce.miss_streak = 0
         self._activated_at = 0.0
+        self._last_center = None
+        self._last_phase = None
+
+    # ── 事件生命周期 + 空间门 helper ──
+
+    @staticmethod
+    def _idle_response() -> dict[str, Any]:
+        return {"ok": True, "active": False, "phase": "idle", "center": None,
+                "confidence": 0.0, "bbox": None, "s_bbox": None}
+
+    def _in_event(self) -> bool:
+        return self.samurai.session_active or self._last_center is not None
+
+    def _end_event(self, reason: str = "") -> None:
+        """事件结束/切换: 停会话, 清目标锚 (下个事件重新锚定)。"""
+        stopped = self.samurai.session_active
+        if stopped:
+            self.samurai.stop()
+        self._last_center = None
+        self._last_phase = None
+        if stopped:
+            print(f"[server] 会话结束 ({reason or '事件结束'})", file=sys.stderr)
+
+    def _gate_center(self, candidate, conf: float, gate_dist: float,
+                     conf_bypass: bool = True):
+        """空间门: 候选中心相对已锚定目标跳变过大 → 判定错选, 返回 (hold_center, False)。
+
+        返回 (输出中心, 是否接受)。接受 → 更新锚; 拒绝 → 输出上帧已接受中心 (hold)。
+        - 无锚 → 接受 (首检即锚)。
+        - conf_bypass=True: 置信 ≥ GATE_HIGH_CONF 的跳变豁免 (强检测可信)。
+          False (countdown): 距离门对置信无豁免 — 倒计时内星形静止, 任何大跳都是错选。
+        """
+        if candidate is None:
+            return (None, False)
+        cand = (int(candidate[0]), int(candidate[1]))
+        if self._last_center is None:
+            self._last_center = cand
+            return (self._last_center, True)
+        d = np.hypot(cand[0] - self._last_center[0], cand[1] - self._last_center[1])
+        if d > gate_dist and (not conf_bypass or conf < GATE_HIGH_CONF):
+            return (self._last_center, False)   # 错选: hold 上帧中心
+        self._last_center = cand
+        return (self._last_center, True)
+
+    def _anchoring_ok(self, r, new_event: bool) -> bool:
+        """重锚定门禁: 能否用本帧 opencv 检测起/重起 samurai 会话 (防 conf=0.25 junk 锚错)。
+
+        - 新事件 (目标位置未知): 只要求最低置信。
+        - 同事件重锚 (会话中途失败/目标短暂丢失): 新检测须靠近上帧目标 (星形连续移动, 置信可低)。
+        """
+        if r.target_center is None:
+            return False
+        if self._last_center is None or new_event:
+            return r.confidence >= REANCHOR_MIN_CONF
+        d = np.hypot(r.target_center[0] - self._last_center[0], r.target_center[1] - self._last_center[1])
+        return d <= REANCHOR_CLOSE_DIST
 
 
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
