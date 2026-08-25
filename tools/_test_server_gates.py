@@ -246,6 +246,24 @@ def main() -> int:
     all_ok &= f_ok
     print(f"  场景F 结果: {'PASS' if f_ok else 'FAIL'} (第2帧确认后重锚 (900,300))")
 
+    # ── 场景 J: 守卫路径 (np.bool_) 响应必须可 JSON 序列化 ──
+    # 回归: 线上 json.dumps 崩 "Object of type bool is not JSON serializable" —
+    # 锚点守卫 `and ... np.hypot(...) > D` 末项是 np.bool_, 落进 diag.anchor_guard。
+    # 测试直调 handle_frame 不经过 _send_json, 得显式过 json.dumps 才抓得住。
+    import json as _json
+    seqJ = [
+        (True, tr, (600, 400), 0.99, (590, 390, 610, 410)),
+        (True, tr, (600, 400), 0.99, (590, 390, 610, 410)),
+        (True, tr, (900, 300), 0.9, (890, 290, 910, 310)),
+        (True, tr, (900, 300), 0.9, (890, 290, 910, 310)),
+    ]
+    outsJ, smJ = run("J: 守卫 np.bool_ 响应 → json.dumps 可序列化", seqJ)
+    j_ok = all(_json.dumps(o) for o in outsJ)          # 每帧都能出 JSON (不崩)
+    j_guard_seen = any((o.get("diag") or {}).get("anchor_guard") for o in outsJ)
+    all_ok &= j_ok
+    print(f"  场景J 结果: {'PASS' if j_ok else 'FAIL'} "
+          f"(np.bool_ 序列化{'守卫已触发' if j_guard_seen else '未触发守卫'} json.dumps 全通过)")
+
     # ── 场景 G: 冷起始 conf=0.25 junk → center=None 不锚; 下帧 conf=0.5 → 正常跟随 ──
     seqG = [
         (True, tr, (368, 432), 0.25, (350, 420, 386, 444)),

@@ -321,7 +321,7 @@ class _ServerState:
                         and r.confidence >= ANCHOR_GUARD_MIN_CONF
                         and np.hypot(s_center[0] - r.target_center[0], s_center[1] - r.target_center[1]) > ANCHOR_GUARD_DIST
                     )
-                    diag["anchor_guard"] = guard
+                    diag["anchor_guard"] = bool(guard)   # np.bool_ 不可 JSON 序列化 (和表达式末项是 np.hypot 比较)
                     diag["branch"] = "samurai_step"
                     if guard:
                         center, accepted = self._tracking_gate(r.target_center, r.confidence, r.target_bbox, frame_bgr)
@@ -610,8 +610,27 @@ class _Handler(BaseHTTPRequestHandler):
         img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         return img
 
+    @staticmethod
+    def _json_clean(obj):
+        """递归把 numpy 标量/数组转成 Python 原生, 否则 json.dumps 崩 (np.bool_ 不可序列化)。"""
+        if isinstance(obj, dict):
+            return {k: _ServerHandler._json_clean(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_ServerHandler._json_clean(v) for v in obj]
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return _ServerHandler._json_clean(obj.tolist())
+        return obj
+
     def _send_json(self, obj: dict, code: int = 200) -> None:
-        body = json.dumps(obj).encode("utf-8")
+        # numpy 标量/数组 (np.bool_/np.float32/...) 不可 json 序列化, 递归清洗
+        # (锚点守卫 np.hypot 比较、samurai float 中心落进 diag.anchor 等都会崩)
+        body = json.dumps(self._json_clean(obj)).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
