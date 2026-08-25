@@ -69,6 +69,10 @@ EVENT_END_MISSES = 2
 # 重锚定门禁: 新事件首锚 (目标位置未知) 需最低置信; 同事件重锚需靠近上帧目标
 REANCHOR_MIN_CONF = 0.35
 REANCHOR_CLOSE_DIST = 100
+# countdown 预热 samurai: 星形倒计时静止且较亮(conf≈0.5), 连续稳定帧后起会话,
+# 让 tracking 一进入就有一致的 mask (直接 tracking 才初始化时弱星形 conf 0.25 易初始化失败)
+COUNTDOWN_STABLE_FRAMES = 3
+COUNTDOWN_ANCHOR_MIN_CONF = 0.35
 
 
 class _ServerState:
@@ -103,6 +107,7 @@ class _ServerState:
         self._track_count = 0
         self._last_center: Optional[Tuple[int, int]] = None   # 最近一次已接受的目标中心 (空间门/hold)
         self._last_phase: Optional[LiePhase] = None           # 上一帧阶段 (countdown 首帧 = 新事件)
+        self._countdown_stable = 0                            # countdown 连续稳定帧计数 (预热 samurai 用)
         self._device: Optional[str] = None
 
         if not self.opencv.ready:
@@ -219,6 +224,19 @@ class _ServerState:
             center, accepted = self._gate_center(r.target_center, r.confidence, COUNTDOWN_GATE_DIST,
                                                  conf_bypass=False)
             bbox_out = r.target_bbox if accepted else None
+            # 预热 samurai: countdown 星形静止且较亮, 连续稳定后起会话 (tracking 进入即有 mask)
+            if not self.samurai.session_active and accepted and r.target_bbox is not None:
+                self._countdown_stable += 1
+                if (self._countdown_stable >= COUNTDOWN_STABLE_FRAMES
+                        and r.confidence >= COUNTDOWN_ANCHOR_MIN_CONF):
+                    try:
+                        self.samurai.start(frame_bgr, tuple(int(v) for v in r.target_bbox))
+                        print(f"[server] countdown 预热会话 @ {center} conf={r.confidence:.2f}",
+                              file=sys.stderr)
+                    except Exception as e:
+                        print(f"[server] countdown 预热失败: {e}", file=sys.stderr)
+            if self.samurai.session_active:
+                self._countdown_stable = 0   # 已起会话, 停止计数
         elif r.phase == LiePhase.TRACKING:
             started = False
             if not self.samurai.session_active:
@@ -291,6 +309,7 @@ class _ServerState:
         self._activated_at = 0.0
         self._last_center = None
         self._last_phase = None
+        self._countdown_stable = 0
 
     # ── 事件生命周期 + 空间门 helper ──
 
@@ -309,6 +328,7 @@ class _ServerState:
             self.samurai.stop()
         self._last_center = None
         self._last_phase = None
+        self._countdown_stable = 0
         if stopped:
             print(f"[server] 会话结束 ({reason or '事件结束'})", file=sys.stderr)
 

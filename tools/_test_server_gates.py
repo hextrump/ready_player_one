@@ -162,6 +162,28 @@ def main() -> int:
     all_ok &= b_ok
     print(f"  场景B 结果: {'PASS' if b_ok else 'FAIL'} (starts 应=1, stops≥1, 帧6 s_bbox=None)")
 
+    # ── 场景 C: countdown 预热 samurai (idx 256 区域) ──
+    # 帧1-4: countdown 星形静止 conf 0.5 (较亮, 连续稳定)
+    # 帧5:   tracking 进入 → 会话已预热 → 直接 step (s_bbox Y)
+    # 期望: starts=1 (countdown 第3帧就起), 帧5 s_bbox 非 None
+    cd = LiePhase.COUNTDOWN
+    tr = LiePhase.TRACKING
+    seqC = [
+        (True, cd, (1060, 44), 0.5, (1040, 20, 1080, 68)),
+        (True, cd, (1060, 44), 0.5, (1040, 20, 1080, 68)),
+        (True, cd, (1060, 44), 0.5, (1040, 20, 1080, 68)),
+        (True, cd, (1060, 44), 0.5, (1040, 20, 1080, 68)),
+        (True, tr, (1060, 44), 0.25, (1040, 20, 1080, 68)),
+    ]
+    outsC, smC = run("C: countdown 预热 (idx 256 场景)", seqC)
+    c_ok = (
+        smC.starts == 1                 # countdown 内预热起过一次
+        and outsC[4]['s_bbox'] is not None  # tracking 首帧直接 step 出 s_bbox
+        and outsC[4]['center'] == [1060, 44]
+    )
+    all_ok &= c_ok
+    print(f"  场景C 结果: {'PASS' if c_ok else 'FAIL'} (starts 应=1, 帧5 s_bbox 非 None)")
+
     print(f"\n全部: {'PASS' if all_ok else 'FAIL'}")
     return 0 if all_ok else 1
 
